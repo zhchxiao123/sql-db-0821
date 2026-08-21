@@ -1,0 +1,26 @@
+# error.test — records that expect an error must pass when the engine errors
+# and fail when it does not (acceptance criterion a5).
+
+statement error
+SELECT * FROM nosuch
+
+statement error
+INSERT INTO nosuch VALUES (1)
+
+statement ok
+CREATE TABLE t (a INTEGER)
+
+statement error
+INSERT INTO t VALUES (1, 2)
+
+statement error
+SELECT nosuch FROM t
+
+statement error
+SELECT * FROM t WHERE
+
+query error
+SELECT * FROM nosuch
+
+query error
+SELECT nosuch FROM t

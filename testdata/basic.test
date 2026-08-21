@@ -1,0 +1,72 @@
+# basic.test — CRUD lifecycle, WHERE, NULL and COUNT(*) in the minimal subset.
+# Every expected value below was verified against sqlite3 3.51.0.
+
+statement ok
+CREATE TABLE t (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'one')
+
+statement ok
+INSERT INTO t VALUES (2, 'two')
+
+statement ok
+INSERT INTO t VALUES (3, 'three')
+
+query IT rowsort
+SELECT * FROM t
+----
+1
+one
+2
+two
+3
+three
+
+query I
+SELECT count(*) FROM t
+----
+3
+
+query IT rowsort
+SELECT * FROM t WHERE a > 1
+----
+2
+two
+3
+three
+
+query T
+SELECT b FROM t WHERE a = 2
+----
+two
+
+statement ok
+UPDATE t SET b = 'TWO' WHERE a = 2
+
+query T
+SELECT b FROM t WHERE a = 2
+----
+TWO
+
+statement ok
+DELETE FROM t WHERE a = 1
+
+query I
+SELECT count(*) FROM t
+----
+2
+
+query IT rowsort
+SELECT * FROM t
+----
+2
+TWO
+3
+three
+
+statement ok
+DROP TABLE t
+
+statement error
+SELECT * FROM t
