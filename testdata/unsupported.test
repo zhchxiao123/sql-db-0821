@@ -1,0 +1,99 @@
+# unsupported.test — constructs outside the minimal SQL subset must return an
+# error (never crash) and are reported as waived by the runner (acceptance
+# criterion a6). Run with --strict to count them as failures instead.
+
+statement ok
+CREATE TABLE t (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'x')
+
+query I rowsort
+SELECT a FROM t ORDER BY a
+----
+1
+
+query I rowsort
+SELECT a FROM t LIMIT 1
+----
+1
+
+query I rowsort
+SELECT DISTINCT a FROM t
+----
+1
+
+query I rowsort
+SELECT a FROM t GROUP BY a
+----
+1
+
+query I rowsort
+SELECT a FROM t HAVING a > 0
+----
+1
+
+query I rowsort
+SELECT a FROM t UNION SELECT a FROM t
+----
+1
+
+query I rowsort
+SELECT CASE WHEN a > 0 THEN 1 ELSE 0 END FROM t
+----
+1
+
+query I rowsort
+SELECT * FROM t WHERE a LIKE '1%'
+----
+1
+
+query I rowsort
+SELECT * FROM t WHERE a BETWEEN 1 AND 2
+----
+1
+
+query I rowsort
+SELECT * FROM t WHERE a IN (1, 2)
+----
+1
+
+query I rowsort
+SELECT * FROM t WHERE a IS NULL
+----
+1
+
+query I rowsort
+SELECT * FROM t WHERE a = 1 AND b = 'x'
+----
+1
+
+query I rowsort
+SELECT abs(a) FROM t
+----
+1
+
+query I rowsort
+SELECT coalesce(a, b) FROM t
+----
+1
+
+query I rowsort
+SELECT (SELECT a FROM t) FROM t
+----
+1
+
+statement error
+CREATE INDEX idx ON t (a)
+
+statement error
+CREATE VIEW v AS SELECT * FROM t
+
+statement error
+ALTER TABLE t ADD COLUMN c INTEGER
+
+statement error
+BEGIN
+
+statement error
+PRAGMA table_info(t)

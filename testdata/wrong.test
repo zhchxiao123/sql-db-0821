@@ -1,0 +1,25 @@
+# wrong.test — deliberately wrong expected values. Running this file must
+# report failures (acceptance criterion a4: a wrong expected result is
+# detected). It is not part of the passing self-test; use it to verify the
+# runner's failure detection:
+#
+#   go run ./cmd/sqllogictest testdata/wrong.test   # exit code 1
+
+statement ok
+CREATE TABLE t (a INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+INSERT INTO t VALUES (2)
+
+query I
+SELECT a FROM t
+----
+99
+
+query I
+SELECT count(*) FROM t
+----
+999
