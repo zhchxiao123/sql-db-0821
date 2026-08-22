@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ const (
 	tokIdent
 	tokString
 	tokNumber
+	tokBlob
 	tokOp
 	tokPunct
 )
@@ -25,9 +27,10 @@ type token struct {
 }
 
 // unsupportedKeywords maps keywords that belong to constructs outside the
-// minimal subset to a human-readable feature name. The parser returns an
+// supported subset to a human-readable feature name. The parser returns an
 // UnsupportedError whenever it meets one of these in a place the grammar
-// does not allow.
+// does not allow. LIKE/GLOB/BETWEEN/IN/IS/NOT/AND/OR are deliberately absent:
+// they are part of the expression subset.
 var unsupportedKeywords = map[string]string{
 	"ORDER":       "ORDER BY",
 	"LIMIT":       "LIMIT",
@@ -50,14 +53,6 @@ var unsupportedKeywords = map[string]string{
 	"ELSE":        "CASE expression",
 	"END":         "CASE expression",
 	"EXISTS":      "EXISTS subquery",
-	"LIKE":        "LIKE",
-	"GLOB":        "GLOB",
-	"BETWEEN":     "BETWEEN",
-	"IN":          "IN",
-	"IS":          "IS NULL",
-	"NOT":         "NOT",
-	"AND":         "AND",
-	"OR":          "OR",
 	"ASC":         "ORDER BY",
 	"DESC":        "ORDER BY",
 	"INDEX":       "CREATE INDEX",
@@ -75,6 +70,20 @@ var unsupportedKeywords = map[string]string{
 	"ANALYZE":     "ANALYZE",
 }
 
+// selectStopKeywords are keywords that terminate a SELECT list, so an
+// identifier following an expression is an alias only when it is not one of
+// these.
+var selectStopKeywords = map[string]bool{
+	"FROM": true, "WHERE": true, "GROUP": true, "ORDER": true, "LIMIT": true,
+	"OFFSET": true, "HAVING": true, "UNION": true, "INTERSECT": true,
+	"EXCEPT": true, "JOIN": true, "INNER": true, "LEFT": true, "RIGHT": true,
+	"FULL": true, "CROSS": true, "NATURAL": true, "ON": true, "USING": true,
+	"AS": true, "AND": true, "OR": true, "NOT": true, "IS": true, "IN": true,
+	"BETWEEN": true, "LIKE": true, "GLOB": true, "CASE": true, "WHEN": true,
+	"THEN": true, "ELSE": true, "END": true, "EXISTS": true, "ASC": true,
+	"DESC": true, "ALL": true, "DISTINCT": true, "ESCAPE": true,
+}
+
 func isIdentStart(c byte) bool {
 	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
@@ -84,12 +93,36 @@ func isIdentPart(c byte) bool {
 }
 
 // tokenize splits SQL text into tokens. String literals use single quotes
-// with ” as the escaped quote, matching SQLite.
+// with '' as the escaped quote, blob literals use X'hex', and == is accepted
+// as an alias for =, all matching SQLite.
 func tokenize(sql string) ([]token, error) {
 	var toks []token
 	i, n := 0, len(sql)
 	for i < n {
 		c := sql[i]
+		// Blob literal: X'hex' or x'hex'.
+		if (c == 'x' || c == 'X') && i+1 < n && sql[i+1] == '\'' {
+			j := i + 2
+			var sb strings.Builder
+			for j < n && sql[j] != '\'' {
+				sb.WriteByte(sql[j])
+				j++
+			}
+			if j >= n {
+				return nil, &SQLError{Message: "unterminated blob literal"}
+			}
+			raw := sb.String()
+			if len(raw)%2 != 0 {
+				return nil, &SQLError{Message: "malformed blob literal"}
+			}
+			bytes, err := hex.DecodeString(raw)
+			if err != nil {
+				return nil, &SQLError{Message: "malformed blob literal"}
+			}
+			toks = append(toks, token{kind: tokBlob, text: string(bytes), pos: i})
+			i = j + 1
+			continue
+		}
 		switch {
 		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
 			i++
@@ -139,15 +172,17 @@ func tokenize(sql string) ([]token, error) {
 			}
 			toks = append(toks, token{kind: tokIdent, text: sql[i:j], pos: i})
 			i = j
-		case c == '(' || c == ')' || c == ',' || c == ';' || c == '*' || c == '.':
+		case c == '(' || c == ')' || c == ',' || c == ';' || c == '.':
 			toks = append(toks, token{kind: tokPunct, text: string(c), pos: i})
 			i++
-		case c == '=' || c == '<' || c == '>' || c == '!' || c == '+' || c == '-' || c == '/' || c == '%':
+		case c == '=' || c == '<' || c == '>' || c == '!' || c == '+' || c == '-' || c == '/' || c == '%' || c == '*':
 			j := i + 1
 			if (c == '<' || c == '>' || c == '!') && j < n && sql[j] == '=' {
 				j++
 			} else if c == '<' && j < n && sql[j] == '>' {
 				j++
+			} else if c == '=' && j < n && sql[j] == '=' {
+				j++ // == is accepted as =
 			}
 			toks = append(toks, token{kind: tokOp, text: sql[i:j], pos: i})
 			i = j
@@ -209,7 +244,7 @@ func (p *parser) checkTrailing() error {
 	return &SQLError{Message: "syntax error near " + t.text}
 }
 
-// parseValue parses a literal: number, string, or NULL.
+// parseValue parses a literal: number, string, blob, or NULL.
 func (p *parser) parseValue() (Value, error) {
 	t := p.peek()
 	switch t.kind {
@@ -230,6 +265,9 @@ func (p *parser) parseValue() (Value, error) {
 	case tokString:
 		p.next()
 		return TextValue(t.text), nil
+	case tokBlob:
+		p.next()
+		return BlobValue(t.text), nil
 	case tokIdent:
 		if strings.EqualFold(t.text, "NULL") {
 			p.next()
@@ -346,7 +384,8 @@ func (e *Engine) parseCreate(p *parser) (*Result, error) {
 	return &Result{}, nil
 }
 
-// parseInsert handles INSERT INTO t [(cols)] VALUES (...).
+// parseInsert handles INSERT INTO t [(cols)] VALUES (...). Values are
+// converted to the target column's affinity, matching SQLite's storage rules.
 func (e *Engine) parseInsert(p *parser) (*Result, error) {
 	p.next() // INSERT
 	if !strings.EqualFold(p.peek().text, "INTO") {
@@ -425,118 +464,213 @@ func (e *Engine) parseInsert(p *parser) (*Result, error) {
 			row[idx] = vals[i]
 		}
 	}
+	// Apply each column's affinity to the stored value.
+	for i := range row {
+		row[i] = applyAffinity(row[i], columnAffinity(tbl.Columns[i].Type))
+	}
 	tbl.Rows = append(tbl.Rows, row)
 	return &Result{Affected: 1}, nil
 }
 
-// parseSelect handles SELECT cols|*|COUNT(*) FROM t [WHERE cond].
+// selectItem is one entry in a SELECT list: an expression plus its result
+// column name.
+type selectItem struct {
+	expr Expr
+	name string
+}
+
+// exprName derives a result column name for an expression without an alias.
+func exprName(e Expr) string {
+	switch n := e.(type) {
+	case *LiteralExpr:
+		return n.val.RenderCLI()
+	case *ColumnExpr:
+		return n.name
+	case *CountStarExpr:
+		return "COUNT(*)"
+	default:
+		return "expr"
+	}
+}
+
+// containsCountStar reports whether an expression tree contains a COUNT(*)
+// marker (used to reject aggregates mixed into a FROM select list).
+func containsCountStar(e Expr) bool {
+	switch n := e.(type) {
+	case *CountStarExpr:
+		return true
+	case *CastExpr:
+		return containsCountStar(n.inner)
+	case *ArithExpr:
+		return containsCountStar(n.left) || containsCountStar(n.right)
+	case *NegExpr:
+		return containsCountStar(n.inner)
+	case *CompareExpr:
+		return containsCountStar(n.left) || containsCountStar(n.right)
+	case *LogicalExpr:
+		return containsCountStar(n.left) || containsCountStar(n.right)
+	case *NotExpr:
+		return containsCountStar(n.inner)
+	case *InExpr:
+		if containsCountStar(n.left) {
+			return true
+		}
+		for _, item := range n.list {
+			if containsCountStar(item) {
+				return true
+			}
+		}
+	case *BetweenExpr:
+		return containsCountStar(n.left) || containsCountStar(n.low) || containsCountStar(n.high)
+	case *LikeExpr:
+		if containsCountStar(n.left) || containsCountStar(n.pattern) {
+			return true
+		}
+		if n.escape != nil {
+			return containsCountStar(n.escape)
+		}
+	}
+	return false
+}
+
+// parseSelect handles SELECT [ALL|DISTINCT] expr [AS alias] [, ...]
+// [FROM t [WHERE expr]]. Without FROM the expressions are evaluated once
+// against a single constant row (SQLite semantics); COUNT(*) evaluates to 1
+// in that context. DISTINCT is a no-op for a constant SELECT and unsupported
+// with FROM.
 func (e *Engine) parseSelect(p *parser) (*Result, error) {
 	p.next() // SELECT
-	if strings.EqualFold(p.peek().text, "DISTINCT") {
-		return nil, &UnsupportedError{Feature: "DISTINCT"}
+	distinct := false
+	if p.isKeyword("ALL") {
+		p.next()
+	} else if p.isKeyword("DISTINCT") {
+		p.next()
+		distinct = true
 	}
-	var selCols []string // nil means "*"
-	isCount := false
-	switch {
-	case p.peek().text == "*":
+	star := false
+	if p.peek().text == "*" {
 		p.next()
-	case strings.EqualFold(p.peek().text, "COUNT"):
-		p.next()
-		if err := p.expectPunct("("); err != nil {
-			return nil, err
-		}
-		if p.peek().text != "*" {
-			return nil, &UnsupportedError{Feature: "aggregate functions other than COUNT(*)"}
-		}
-		p.next()
-		if err := p.expectPunct(")"); err != nil {
-			return nil, err
-		}
-		isCount = true
-	default:
+		star = true
+	}
+	var items []selectItem
+	if !star {
 		for {
-			t := p.peek()
-			if t.kind == tokPunct && t.text == "(" {
-				return nil, &UnsupportedError{Feature: "subquery"}
-			}
-			if t.kind == tokIdent {
-				if f, ok := unsupportedKeywords[strings.ToUpper(t.text)]; ok {
-					return nil, &UnsupportedError{Feature: f}
-				}
-			}
-			cn, err := p.expectIdent()
+			expr, err := p.parseExpr()
 			if err != nil {
 				return nil, err
 			}
-			selCols = append(selCols, cn)
-			switch p.peek().text {
-			case ",":
+			name := exprName(expr)
+			if p.isKeyword("AS") {
+				p.next()
+				an, err := p.expectIdent()
+				if err != nil {
+					return nil, err
+				}
+				name = an
+			} else if t := p.peek(); t.kind == tokIdent && !selectStopKeywords[strings.ToUpper(t.text)] {
+				p.next()
+				name = t.text
+			}
+			items = append(items, selectItem{expr: expr, name: name})
+			if p.peek().text == "," {
 				p.next()
 				continue
-			case ".":
-				return nil, &UnsupportedError{Feature: "qualified column reference"}
-			case "(", "*":
-				return nil, &UnsupportedError{Feature: "arithmetic expression"}
-			}
-			if p.peek().kind == tokOp {
-				return nil, &UnsupportedError{Feature: "arithmetic expression"}
 			}
 			break
 		}
 	}
-	if !strings.EqualFold(p.peek().text, "FROM") {
-		return nil, &SQLError{Message: "expected FROM in SELECT"}
-	}
-	p.next()
-	name, err := p.expectIdent()
-	if err != nil {
-		return nil, err
-	}
-	switch p.peek().text {
-	case ",":
-		return nil, &UnsupportedError{Feature: "JOIN"}
-	case ".":
-		return nil, &UnsupportedError{Feature: "qualified column reference"}
-	case "(":
-		return nil, &UnsupportedError{Feature: "subquery in FROM"}
-	}
-	if strings.EqualFold(p.peek().text, "JOIN") {
-		return nil, &UnsupportedError{Feature: "JOIN"}
-	}
+	var tbl *Table
 	var cond Expr
-	if strings.EqualFold(p.peek().text, "WHERE") {
+	if p.isKeyword("FROM") {
 		p.next()
-		cond, err = p.parseCondition()
+		name, err := p.expectIdent()
 		if err != nil {
 			return nil, err
 		}
-	}
-	if err := p.checkTrailing(); err != nil {
-		return nil, err
-	}
-	tbl, ok := e.tables[name]
-	if !ok {
-		return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
-	}
-	if isCount {
-		var n int64
-		for _, row := range tbl.Rows {
-			if cond == nil || condTrue(cond, row, tbl.Columns) {
-				n++
+		switch p.peek().text {
+		case ",":
+			return nil, &UnsupportedError{Feature: "JOIN"}
+		case ".":
+			return nil, &UnsupportedError{Feature: "qualified column reference"}
+		case "(":
+			return nil, &UnsupportedError{Feature: "subquery in FROM"}
+		}
+		if p.isKeyword("JOIN") {
+			return nil, &UnsupportedError{Feature: "JOIN"}
+		}
+		if p.isKeyword("WHERE") {
+			p.next()
+			cond, err = p.parseExpr()
+			if err != nil {
+				return nil, err
 			}
 		}
-		return &Result{Columns: []string{"COUNT(*)"}, Rows: [][]Value{{IntValue(n)}}}, nil
-	}
-	var outCols []Column
-	if selCols == nil {
-		outCols = tbl.Columns
+		if err := p.checkTrailing(); err != nil {
+			return nil, err
+		}
+		var ok bool
+		tbl, ok = e.tables[name]
+		if !ok {
+			return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
+		}
 	} else {
-		for _, cn := range selCols {
-			idx := tbl.columnIndex(cn)
-			if idx < 0 {
-				return nil, &SQLError{Message: fmt.Sprintf("no such column: %s", cn)}
+		if err := p.checkTrailing(); err != nil {
+			return nil, err
+		}
+	}
+	if star {
+		if tbl == nil {
+			return nil, &SQLError{Message: "SELECT * requires a FROM clause"}
+		}
+		for _, c := range tbl.Columns {
+			items = append(items, selectItem{expr: &ColumnExpr{name: c.Name}, name: c.Name})
+		}
+	}
+	if tbl == nil {
+		// Constant SELECT: evaluate once against an empty row. DISTINCT is a
+		// no-op because there is only one row.
+		row := make([]Value, len(items))
+		for i, it := range items {
+			v, err := it.expr.eval(nil, nil)
+			if err != nil {
+				return nil, err
 			}
-			outCols = append(outCols, tbl.Columns[idx])
+			row[i] = v
+		}
+		colNames := make([]string, len(items))
+		for i, it := range items {
+			colNames[i] = it.name
+		}
+		return &Result{Columns: colNames, Rows: [][]Value{row}}, nil
+	}
+	if distinct {
+		return nil, &UnsupportedError{Feature: "DISTINCT"}
+	}
+	// Resolve column affinities so comparisons follow SQLite's rules.
+	if err := resolveColumnAffinity(cond, tbl.Columns); err != nil {
+		return nil, err
+	}
+	for _, it := range items {
+		if err := resolveColumnAffinity(it.expr, tbl.Columns); err != nil {
+			return nil, err
+		}
+	}
+	// Bare COUNT(*) counts rows.
+	if len(items) == 1 {
+		if _, ok := items[0].expr.(*CountStarExpr); ok {
+			var n int64
+			for _, row := range tbl.Rows {
+				if cond == nil || condTrue(cond, row, tbl.Columns) {
+					n++
+				}
+			}
+			return &Result{Columns: []string{"COUNT(*)"}, Rows: [][]Value{{IntValue(n)}}}, nil
+		}
+	}
+	// Aggregates mixed into an expression list are outside the subset.
+	for _, it := range items {
+		if containsCountStar(it.expr) {
+			return nil, &UnsupportedError{Feature: "aggregate function in expression list"}
 		}
 	}
 	var rows [][]Value
@@ -544,20 +678,24 @@ func (e *Engine) parseSelect(p *parser) (*Result, error) {
 		if cond != nil && !condTrue(cond, row, tbl.Columns) {
 			continue
 		}
-		out := make([]Value, len(outCols))
-		for i, c := range outCols {
-			out[i] = row[tbl.columnIndex(c.Name)]
+		out := make([]Value, len(items))
+		for i, it := range items {
+			v, err := it.expr.eval(row, tbl.Columns)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = v
 		}
 		rows = append(rows, out)
 	}
-	colNames := make([]string, len(outCols))
-	for i, c := range outCols {
-		colNames[i] = c.Name
+	colNames := make([]string, len(items))
+	for i, it := range items {
+		colNames[i] = it.name
 	}
 	return &Result{Columns: colNames, Rows: rows}, nil
 }
 
-// parseUpdate handles UPDATE t SET col = val [, ...] [WHERE cond].
+// parseUpdate handles UPDATE t SET col = expr [, ...] [WHERE expr].
 func (e *Engine) parseUpdate(p *parser) (*Result, error) {
 	p.next() // UPDATE
 	name, err := p.expectIdent()
@@ -582,7 +720,7 @@ func (e *Engine) parseUpdate(p *parser) (*Result, error) {
 			return nil, &SQLError{Message: "expected = in SET clause"}
 		}
 		p.next()
-		val, err := p.parseOperand()
+		val, err := p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
@@ -596,7 +734,7 @@ func (e *Engine) parseUpdate(p *parser) (*Result, error) {
 	var cond Expr
 	if strings.EqualFold(p.peek().text, "WHERE") {
 		p.next()
-		cond, err = p.parseCondition()
+		cond, err = p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
@@ -616,6 +754,14 @@ func (e *Engine) parseUpdate(p *parser) (*Result, error) {
 		}
 		idxs[i] = idx
 	}
+	if err := resolveColumnAffinity(cond, tbl.Columns); err != nil {
+		return nil, err
+	}
+	for _, a := range assigns {
+		if err := resolveColumnAffinity(a.val, tbl.Columns); err != nil {
+			return nil, err
+		}
+	}
 	var affected int64
 	for _, row := range tbl.Rows {
 		if cond != nil && !condTrue(cond, row, tbl.Columns) {
@@ -633,7 +779,7 @@ func (e *Engine) parseUpdate(p *parser) (*Result, error) {
 	return &Result{Affected: affected}, nil
 }
 
-// parseDelete handles DELETE FROM t [WHERE cond].
+// parseDelete handles DELETE FROM t [WHERE expr].
 func (e *Engine) parseDelete(p *parser) (*Result, error) {
 	p.next() // DELETE
 	if !strings.EqualFold(p.peek().text, "FROM") {
@@ -647,7 +793,7 @@ func (e *Engine) parseDelete(p *parser) (*Result, error) {
 	var cond Expr
 	if strings.EqualFold(p.peek().text, "WHERE") {
 		p.next()
-		cond, err = p.parseCondition()
+		cond, err = p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
@@ -658,6 +804,9 @@ func (e *Engine) parseDelete(p *parser) (*Result, error) {
 	tbl, ok := e.tables[name]
 	if !ok {
 		return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
+	}
+	if err := resolveColumnAffinity(cond, tbl.Columns); err != nil {
+		return nil, err
 	}
 	var kept [][]Value
 	var affected int64
