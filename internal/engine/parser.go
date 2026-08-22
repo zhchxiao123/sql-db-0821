@@ -32,30 +32,22 @@ type token struct {
 // does not allow. LIKE/GLOB/BETWEEN/IN/IS/NOT/AND/OR are deliberately absent:
 // they are part of the expression subset.
 var unsupportedKeywords = map[string]string{
-	"ORDER":       "ORDER BY",
-	"LIMIT":       "LIMIT",
-	"OFFSET":      "OFFSET",
-	"DISTINCT":    "DISTINCT",
-	"GROUP":       "GROUP BY",
-	"HAVING":      "HAVING",
-	"JOIN":        "JOIN",
-	"INNER":       "JOIN",
-	"LEFT":        "JOIN",
-	"RIGHT":       "JOIN",
-	"FULL":        "JOIN",
-	"CROSS":       "JOIN",
-	"UNION":       "UNION",
-	"INTERSECT":   "UNION",
-	"EXCEPT":      "UNION",
-	"CASE":        "CASE expression",
-	"WHEN":        "CASE expression",
-	"THEN":        "CASE expression",
-	"ELSE":        "CASE expression",
-	"END":         "CASE expression",
-	"EXISTS":      "EXISTS subquery",
-	"ASC":         "ORDER BY",
-	"DESC":        "ORDER BY",
-	"INDEX":       "CREATE INDEX",
+	"JOIN":     "JOIN",
+	"INNER":    "JOIN",
+	"LEFT":     "JOIN",
+	"RIGHT":    "JOIN",
+	"FULL":     "JOIN",
+	"CROSS":    "JOIN",
+	"UNION":    "UNION",
+	"INTERSECT": "UNION",
+	"EXCEPT":   "UNION",
+	"CASE":     "CASE expression",
+	"WHEN":     "CASE expression",
+	"THEN":     "CASE expression",
+	"ELSE":     "CASE expression",
+	"END":      "CASE expression",
+	"EXISTS":   "EXISTS subquery",
+	"INDEX":    "CREATE INDEX",
 	"ALTER":       "ALTER TABLE",
 	"VIEW":        "VIEW",
 	"TRANSACTION": "transaction",
@@ -486,8 +478,11 @@ func exprName(e Expr) string {
 		return n.val.RenderCLI()
 	case *ColumnExpr:
 		return n.name
-	case *CountStarExpr:
-		return "COUNT(*)"
+	case *AggExpr:
+		if n.star {
+			return "COUNT(*)"
+		}
+		return n.funcName + "(expr)"
 	default:
 		return "expr"
 	}
@@ -533,11 +528,11 @@ func containsCountStar(e Expr) bool {
 	return false
 }
 
-// parseSelect handles SELECT [ALL|DISTINCT] expr [AS alias] [, ...]
-// [FROM t [WHERE expr]]. Without FROM the expressions are evaluated once
-// against a single constant row (SQLite semantics); COUNT(*) evaluates to 1
-// in that context. DISTINCT is a no-op for a constant SELECT and unsupported
-// with FROM.
+// parseSelect handles a full single-table SELECT: select list, FROM+WHERE,
+// GROUP BY, HAVING, ORDER BY (ordinal or expression keys, ASC/DESC, NULL
+// placement), LIMIT/OFFSET and DISTINCT. An aggregate query (one with GROUP BY
+// or an aggregate in the select list or HAVING) computes one output row per
+// group; a without-FROM SELECT supplies a single constant row so COUNT(*)=1.
 func (e *Engine) parseSelect(p *parser) (*Result, error) {
 	p.next() // SELECT
 	distinct := false
@@ -581,6 +576,7 @@ func (e *Engine) parseSelect(p *parser) (*Result, error) {
 	}
 	var tbl *Table
 	var cond Expr
+	var err error
 	if p.isKeyword("FROM") {
 		p.next()
 		name, err := p.expectIdent()
@@ -605,18 +601,128 @@ func (e *Engine) parseSelect(p *parser) (*Result, error) {
 				return nil, err
 			}
 		}
-		if err := p.checkTrailing(); err != nil {
-			return nil, err
-		}
 		var ok bool
 		tbl, ok = e.tables[name]
 		if !ok {
 			return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
 		}
-	} else {
-		if err := p.checkTrailing(); err != nil {
+	}
+	cols := []Column(nil)
+	if tbl != nil {
+		cols = tbl.Columns
+	}
+	// GROUP BY expr [, ...]
+	var groupBy []Expr
+	if p.isKeyword("GROUP") {
+		p.next()
+		if !p.isKeyword("BY") {
+			return nil, &SQLError{Message: "expected BY after GROUP"}
+		}
+		p.next()
+		for {
+			g, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			groupBy = append(groupBy, g)
+			if p.peek().text == "," {
+				p.next()
+				continue
+			}
+			break
+		}
+	}
+	// HAVING expr
+	var having Expr
+	if p.isKeyword("HAVING") {
+		p.next()
+		having, err = p.parseExpr()
+		if err != nil {
 			return nil, err
 		}
+	}
+	// ORDER BY term [ASC|DESC] [, ...]
+	var order []orderTerm
+	if p.isKeyword("ORDER") {
+		p.next()
+		if !p.isKeyword("BY") {
+			return nil, &SQLError{Message: "expected BY after ORDER"}
+		}
+		p.next()
+		for {
+			var term orderTerm
+			if t := p.peek(); t.kind == tokNumber && isIntLiteral(t.text) {
+				ord, err := strconv.Atoi(t.text)
+				if err != nil {
+					return nil, &SQLError{Message: "invalid ORDER BY term"}
+				}
+				term.ordinal = ord
+				p.next()
+			} else {
+				ex, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				term.expr = ex
+			}
+			if p.isKeyword("ASC") {
+				p.next()
+			} else if p.isKeyword("DESC") {
+				p.next()
+				term.desc = true
+			}
+			order = append(order, term)
+			if p.peek().text == "," {
+				p.next()
+				continue
+			}
+			break
+		}
+	}
+	// LIMIT n [OFFSET m] | LIMIT n, m | OFFSET m
+	var limit, offset int
+	haveLimit := false
+	if p.isKeyword("LIMIT") {
+		p.next()
+		haveLimit = true
+		lev, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		lv, err := lev.eval(nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		if p.isKeyword("OFFSET") {
+			p.next()
+			oev, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			ov, err := oev.eval(nil, nil)
+			if err != nil {
+				return nil, err
+			}
+			limit, offset = int(intValueOf(lv)), int(intValueOf(ov))
+		} else if p.peek().text == "," {
+			p.next()
+			oev, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			ov, err := oev.eval(nil, nil)
+			if err != nil {
+				return nil, err
+			}
+			limit, offset = int(intValueOf(ov)), int(intValueOf(lv))
+		} else {
+			limit, offset = int(intValueOf(lv)), 0
+		}
+	} else if p.isKeyword("OFFSET") {
+		return nil, &SQLError{Message: "OFFSET requires a LIMIT clause"}
+	}
+	if err := p.checkTrailing(); err != nil {
+		return nil, err
 	}
 	if star {
 		if tbl == nil {
@@ -626,73 +732,180 @@ func (e *Engine) parseSelect(p *parser) (*Result, error) {
 			items = append(items, selectItem{expr: &ColumnExpr{name: c.Name}, name: c.Name})
 		}
 	}
-	if tbl == nil {
-		// Constant SELECT: evaluate once against an empty row. DISTINCT is a
-		// no-op because there is only one row.
-		row := make([]Value, len(items))
-		for i, it := range items {
-			v, err := it.expr.eval(nil, nil)
-			if err != nil {
-				return nil, err
-			}
-			row[i] = v
-		}
-		colNames := make([]string, len(items))
-		for i, it := range items {
-			colNames[i] = it.name
-		}
-		return &Result{Columns: colNames, Rows: [][]Value{row}}, nil
-	}
-	if distinct {
-		return nil, &UnsupportedError{Feature: "DISTINCT"}
-	}
-	// Resolve column affinities so comparisons follow SQLite's rules.
-	if err := resolveColumnAffinity(cond, tbl.Columns); err != nil {
+	// Resolve column affinities (also validates column names).
+	if err := resolveColumnAffinity(cond, cols); err != nil {
 		return nil, err
 	}
 	for _, it := range items {
-		if err := resolveColumnAffinity(it.expr, tbl.Columns); err != nil {
+		if err := resolveColumnAffinity(it.expr, cols); err != nil {
 			return nil, err
 		}
 	}
-	// Bare COUNT(*) counts rows.
-	if len(items) == 1 {
-		if _, ok := items[0].expr.(*CountStarExpr); ok {
-			var n int64
-			for _, row := range tbl.Rows {
-				if cond == nil || condTrue(cond, row, tbl.Columns) {
-					n++
-				}
+	for _, g := range groupBy {
+		if err := resolveColumnAffinity(g, cols); err != nil {
+			return nil, err
+		}
+	}
+	if having != nil {
+		if err := resolveColumnAffinity(having, cols); err != nil {
+			return nil, err
+		}
+	}
+	// Aggregate query: GROUP BY present, or an aggregate in the select list or
+	// HAVING. HAVING on a non-aggregate query is a SQLite parse error.
+	aggQuery := len(groupBy) > 0
+	if !aggQuery {
+		for _, it := range items {
+			if hasAggregate(it.expr) {
+				aggQuery = true
+				break
 			}
-			return &Result{Columns: []string{"COUNT(*)"}, Rows: [][]Value{{IntValue(n)}}}, nil
 		}
 	}
-	// Aggregates mixed into an expression list are outside the subset.
-	for _, it := range items {
-		if containsCountStar(it.expr) {
-			return nil, &UnsupportedError{Feature: "aggregate function in expression list"}
-		}
+	if !aggQuery && having != nil {
+		aggQuery = hasAggregate(having)
 	}
-	var rows [][]Value
-	for _, row := range tbl.Rows {
-		if cond != nil && !condTrue(cond, row, tbl.Columns) {
-			continue
+	if having != nil && !aggQuery {
+		return nil, &SQLError{Message: "HAVING clause on a non-aggregate query"}
+	}
+	// WHERE-filtered source rows (or a single constant row when there is no
+	// FROM).
+	var condRows [][]Value
+	if tbl != nil {
+		for _, row := range tbl.Rows {
+			if cond != nil && !condTrue(cond, row, tbl.Columns) {
+				continue
+			}
+			condRows = append(condRows, row)
 		}
-		out := make([]Value, len(items))
-		for i, it := range items {
-			v, err := it.expr.eval(row, tbl.Columns)
-			if err != nil {
+	} else {
+		condRows = [][]Value{{}}
+	}
+	var outRows [][]Value
+	if aggQuery {
+		if len(groupBy) > 0 {
+			if err := checkGroupColumns(items, having, groupBy); err != nil {
 				return nil, err
 			}
-			out[i] = v
 		}
-		rows = append(rows, out)
+		// Rewrite aggregates across items + HAVING into one shared slot list.
+		var aggList []*AggExpr
+		for i := range items {
+			ne, lst := replaceAggregates(items[i].expr, aggList, false)
+			items[i].expr = ne
+			aggList = lst
+		}
+		var havingSlotted Expr
+		if having != nil {
+			var lst []*AggExpr
+			havingSlotted, lst = replaceAggregates(having, aggList, false)
+			aggList = lst
+		}
+		// Evaluate each GROUP BY key per source row.
+		var keyRows [][]Value
+		for _, row := range condRows {
+			var kv []Value
+			for _, g := range groupBy {
+				v, err := g.eval(row, cols)
+				if err != nil {
+					return nil, err
+				}
+				kv = append(kv, v)
+			}
+			keyRows = append(keyRows, kv)
+		}
+		var keyIdx []int
+		for i := range groupBy {
+			keyIdx = append(keyIdx, i)
+		}
+		groups := partitionGroups(keyRows, keyIdx)
+		colLen := 0
+		if cols != nil {
+			colLen = len(cols)
+		}
+		for _, g := range groups {
+			var groupRows [][]Value
+			for _, gi := range g {
+				groupRows = append(groupRows, condRows[gi])
+			}
+			aggVals := make([]Value, len(aggList))
+			for i, a := range aggList {
+				v, err := evalAgg(a, groupRows, cols)
+				if err != nil {
+					return nil, err
+				}
+				aggVals[i] = v
+			}
+			// The group row is the first source row (or all-NULL for an empty
+			// group) with the aggregate values appended.
+			base := make([]Value, colLen)
+			if len(g) > 0 {
+				copy(base, condRows[g[0]])
+			}
+			grow := append(base, aggVals...)
+			if havingSlotted != nil {
+				hv, err := havingSlotted.eval(grow, cols)
+				if err != nil {
+					return nil, err
+				}
+				if hv.kind != Int || hv.intVal == 0 {
+					continue
+				}
+			}
+			out := make([]Value, len(items))
+			for i, it := range items {
+				v, err := it.expr.eval(grow, cols)
+				if err != nil {
+					return nil, err
+				}
+				out[i] = v
+			}
+			outRows = append(outRows, out)
+		}
+	} else {
+		for _, row := range condRows {
+			out := make([]Value, len(items))
+			for i, it := range items {
+				v, err := it.expr.eval(row, cols)
+				if err != nil {
+					return nil, err
+				}
+				out[i] = v
+			}
+			outRows = append(outRows, out)
+		}
+	}
+	if distinct {
+		outRows = dedupRows(outRows)
+	}
+	if len(order) > 0 {
+		outCols := make([]Column, len(items))
+		for i, it := range items {
+			outCols[i] = Column{Name: it.name}
+		}
+		if serr := sortRowsByKeys(outRows, outCols, order); serr != nil {
+			return nil, serr
+		}
+	}
+	if haveLimit {
+		off := offset
+		if off < 0 {
+			off = 0
+		}
+		if off > len(outRows) {
+			outRows = nil
+		} else {
+			outRows = outRows[off:]
+		}
+		if limit >= 0 && limit < len(outRows) {
+			outRows = outRows[:limit]
+		}
 	}
 	colNames := make([]string, len(items))
 	for i, it := range items {
 		colNames[i] = it.name
 	}
-	return &Result{Columns: colNames, Rows: rows}, nil
+	return &Result{Columns: colNames, Rows: outRows}, nil
 }
 
 // parseUpdate handles UPDATE t SET col = expr [, ...] [WHERE expr].

@@ -140,11 +140,11 @@ statement ok
 INSERT INTO t VALUES (1)
 
 query I rowsort
-SELECT a FROM t ORDER BY a
+SELECT abs(a) FROM t
 ----
 1
 `)
-	// Non-strict: the ORDER BY record is waived, not failed.
+	// Non-strict: the unsupported-construct record is waived, not failed.
 	stats, err := RunFile(path, Options{})
 	if err != nil {
 		t.Fatal(err)

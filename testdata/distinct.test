@@ -1,0 +1,41 @@
+# distinct.test — SELECT DISTINCT whole-row deduplication. NULL is treated as
+# equal to NULL for dedup purposes (matching SQLite), so repeated NULL rows
+# collapse to one.
+# Every expected value below was verified against sqlite3 3.51.0.
+
+statement ok
+CREATE TABLE t (a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1,1)
+
+statement ok
+INSERT INTO t VALUES (1,1)
+
+statement ok
+INSERT INTO t VALUES (1,2)
+
+statement ok
+INSERT INTO t VALUES (NULL,NULL)
+
+statement ok
+INSERT INTO t VALUES (NULL,NULL)
+
+query I rowsort
+SELECT DISTINCT a FROM t
+----
+1
+NULL
+
+query II rowsort
+SELECT DISTINCT a, b FROM t
+----
+1
+1
+1
+2
+NULL
+NULL
+
+statement ok
+DROP TABLE t

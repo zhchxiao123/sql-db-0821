@@ -1,0 +1,86 @@
+# aggregate.test — scalar aggregations COUNT/SUM/AVG/MIN/MAX with ALL/DISTINCT
+# modifiers, NULL-ignoring arguments, and constant (no-FROM) aggregates.
+# Every expected value below was verified against sqlite3 3.51.0.
+
+statement ok
+CREATE TABLE n (a INTEGER)
+
+statement ok
+INSERT INTO n VALUES (1)
+
+statement ok
+INSERT INTO n VALUES (2)
+
+statement ok
+INSERT INTO n VALUES (1)
+
+statement ok
+INSERT INTO n VALUES (NULL)
+
+query IIII
+SELECT count(*), count(a), count(all a), count(distinct a) FROM n
+----
+4
+3
+3
+2
+
+query III
+SELECT sum(a), sum(all a), sum(distinct a) FROM n
+----
+4
+4
+3
+
+query T
+SELECT avg(a) FROM n
+----
+1.33333333333333
+
+query TT
+SELECT avg(all a), avg(distinct a) FROM n
+----
+1.33333333333333
+1.5
+
+query II
+SELECT min(a), max(a) FROM n
+----
+1
+2
+
+# Aggregates ignore NULL arguments (matching SQLite).
+query I
+SELECT count(a) FROM n
+----
+3
+
+query T
+SELECT avg(a) FROM n
+----
+1.33333333333333
+
+# Constant / no-FROM aggregate SELECTs.
+query I
+SELECT count(*) + 1
+----
+2
+
+query I
+SELECT 2 + 3
+----
+5
+
+# A WHERE clause that matches nothing still yields one aggregate row.
+query I
+SELECT count(*) FROM n WHERE a = 7
+----
+0
+
+query R
+SELECT sum(a) FROM n WHERE a = 7
+----
+NULL
+
+statement ok
+DROP TABLE n
