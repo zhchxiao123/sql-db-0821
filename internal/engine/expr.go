@@ -8,6 +8,22 @@ import (
 	"strings"
 )
 
+// outerRowStack / outerColsStack hold the enclosing query's current row and
+// column set while a correlated subquery is running. runSub pushes one frame
+// per nesting level so a subquery can reference columns of any enclosing
+// SELECT. currentOuterRow returns the innermost frame.
+var (
+	outerRowStack  [][]Value
+	outerColsStack [][]Column
+)
+
+func currentOuterRow() []Value {
+	if len(outerRowStack) == 0 {
+		return nil
+	}
+	return outerRowStack[len(outerRowStack)-1]
+}
+
 // Expr is a value expression: a literal, a column reference, or an operator
 // application. Every node knows how to evaluate itself against a row and
 // which affinity it carries (used for comparisons, matching SQLite's
@@ -35,15 +51,29 @@ func (e *LiteralExpr) affinity() Affinity { return AffNone }
 // against the row layout. aff is the column's affinity, filled in by
 // resolveColumnAffinity once the statement's table is known.
 type ColumnExpr struct {
-	name string
-	aff  Affinity
+	name     string
+	aff      Affinity
+	qual     string // source qualifier when written "qual.name"; "" for unqualified
+	outer    bool   // correlated reference: read currentOuterRow()[outerIdx]
+	outerIdx int
 }
 
 func (e *ColumnExpr) eval(row []Value, cols []Column) (Value, error) {
-	for i, c := range cols {
-		if strings.EqualFold(c.Name, e.name) {
-			return row[i], nil
+	if e.outer {
+		ror := currentOuterRow()
+		if ror == nil || e.outerIdx < 0 || e.outerIdx >= len(ror) {
+			return Value{}, &SQLError{Message: fmt.Sprintf("no such column: %s", e.name)}
 		}
+		return ror[e.outerIdx], nil
+	}
+	for i, c := range cols {
+		if !strings.EqualFold(c.Name, e.name) {
+			continue
+		}
+		if e.qual != "" && !strings.EqualFold(c.Qual, e.qual) {
+			continue
+		}
+		return row[i], nil
 	}
 	return Value{}, &SQLError{Message: fmt.Sprintf("no such column: %s", e.name)}
 }
@@ -268,7 +298,7 @@ func (e *InExpr) affinity() Affinity { return AffNone }
 // BetweenExpr is "x BETWEEN low AND high" (or NOT BETWEEN), which SQLite
 // rewrites as x >= low AND x <= high.
 type BetweenExpr struct {
-	negate      bool
+	negate          bool
 	left, low, high Expr
 }
 
@@ -1041,11 +1071,19 @@ func (p *parser) parseComparison() (Expr, error) {
 				switch {
 				case p.isKeyword("IN"):
 					p.next()
-					item, err := p.parseInList()
+					insub, err := p.e.parseInSub(p, left, true)
 					if err != nil {
 						return nil, err
 					}
-					left = &InExpr{negate: true, left: left, list: item}
+					if insub != nil {
+						left = insub
+					} else {
+						item, err := p.parseInList()
+						if err != nil {
+							return nil, err
+						}
+						left = &InExpr{negate: true, left: left, list: item}
+					}
 				case p.isKeyword("BETWEEN"):
 					p.next()
 					low, err := p.parseAdditive()
@@ -1083,11 +1121,19 @@ func (p *parser) parseComparison() (Expr, error) {
 				continue
 			case "IN":
 				p.next()
-				item, err := p.parseInList()
+				insub, err := p.e.parseInSub(p, left, false)
 				if err != nil {
 					return nil, err
 				}
-				left = &InExpr{left: left, list: item}
+				if insub != nil {
+					left = insub
+				} else {
+					item, err := p.parseInList()
+					if err != nil {
+						return nil, err
+					}
+					left = &InExpr{left: left, list: item}
+				}
 				continue
 			case "BETWEEN":
 				p.next()
@@ -1129,7 +1175,10 @@ func (p *parser) parseComparison() (Expr, error) {
 	return left, nil
 }
 
-// parseInList parses "(expr, expr, ...)" after the IN keyword.
+// parseInList parses "(expr, expr, ...)" after the IN keyword. If the content
+// begins with SELECT it is an IN (SELECT ...) subquery; parseInSub handles that
+// at the comparison level (see parseComparison) so the subquery node carries the
+// left-hand side. The plain form returns the literal list.
 func (p *parser) parseInList() ([]Expr, error) {
 	if err := p.expectPunct("("); err != nil {
 		return nil, err
@@ -1259,6 +1308,23 @@ func (p *parser) parsePrimary() (Expr, error) {
 		case "FALSE":
 			p.next()
 			return &LiteralExpr{val: IntValue(0)}, nil
+		case "EXISTS":
+			// EXISTS (SELECT ...): true iff the subquery yields at least one row.
+			p.next()
+			if err := p.expectPunct("("); err != nil {
+				return nil, err
+			}
+			if !p.isKeyword("SELECT") {
+				return nil, &SQLError{Message: "expected SELECT in EXISTS"}
+			}
+			a := p.pos
+			b, err := p.scanClose(a)
+			if err != nil {
+				return nil, err
+			}
+			sub := &SubQueryExpr{toks: p.toks, a: a, b: b, e: p.e}
+			p.pos = b + 1
+			return &ExistsExpr{sub: sub}, nil
 		case "CAST":
 			p.next()
 			if err := p.expectPunct("("); err != nil {
@@ -1328,6 +1394,15 @@ func (p *parser) parsePrimary() (Expr, error) {
 			return nil, &UnsupportedError{Feature: f}
 		}
 		p.next()
+		// Qualified column reference: table alias ".", column name.
+		if p.peek().text == "." {
+			p.next()
+			col, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			return &ColumnExpr{name: col, qual: t.text}, nil
+		}
 		if p.peek().text == "(" {
 			return nil, &UnsupportedError{Feature: "function call"}
 		}
@@ -1337,7 +1412,15 @@ func (p *parser) parsePrimary() (Expr, error) {
 		case "(":
 			p.next()
 			if p.isKeyword("SELECT") {
-				return nil, &UnsupportedError{Feature: "subquery"}
+				// Scalar subquery: scan the balanced range and defer to eval.
+				a := p.pos
+				b, err := p.scanClose(a)
+				if err != nil {
+					return nil, err
+				}
+				sub := &SubQueryExpr{toks: p.toks, a: a, b: b, e: p.e}
+				p.pos = b + 1
+				return sub, nil
 			}
 			inner, err := p.parseExpr()
 			if err != nil {
@@ -1347,8 +1430,6 @@ func (p *parser) parsePrimary() (Expr, error) {
 				return nil, err
 			}
 			return inner, nil
-		case ".":
-			return nil, &UnsupportedError{Feature: "qualified column reference"}
 		}
 	}
 	return nil, &SQLError{Message: "expected a value, got " + t.text}
@@ -1386,17 +1467,41 @@ func isCompareOp(op string) bool {
 	return false
 }
 
-// aggregateValue computes one aggregate over a group of rows. It matches
-// SQLite 3.51.0 exactly: COUNT(*) counts rows, COUNT(expr)/COUNT(DISTINCT)\n// count non-NULL values (NULL is always ignored, including under DISTINCT),\n// SUM accumulates as INTEGER while all inputs are non-NULL integers and\n// reverts to REAL as soon as any input is a real; an all-integer SUM that\n// overflows int64 raises an \"integer overflow\" error. AVG always returns a\n// REAL. MIN/MAX ignore NULL and use storage-class ordering. An empty group\n// (or one whose argument values are all NULL) yields COUNT=0 and\n// SUM/AVG/MIN/MAX=NULL, still producing one aggregated row.\nfunc aggregateValue(agg *AggExpr, rows [][]Value, cols []Column, i int) (Value, error) {\n\tgroupRows := rows // rows already filtered by index i\n\tswitch agg.funcName {\n\tcase \"COUNT\":\n\t\tif agg.star {\n\t\t\treturn IntValue(int64(len(groupRows))), nil\n\t\t}\n\t\tn := int64(0)\n\t\tfor _, r := range groupRows {\n\t\t\tv, err := agg.arg.eval(r, cols)\n\t\t\tif err != nil {\n\t\t\t\treturn Value{}, err\n\t\t\t}\n\t\t\tif v.kind != Null {\n\t\t\t\tn++\n\t\t\t}\n\t\t}\n\t\treturn IntValue(n), nil\n\tcase \"SUM\":\n\t\tvar sumInt int64\n\t\tvar sumReal float64\n\t\tvar sawNULL bool\n\t\tvar sawInt, sawReal int\n\t\tvals := aggValues(agg, groupRows, cols)\n\t\tfor _, v := range vals {\n\t\t\tif v.kind == Null {\n\t\t\t\tsawNULL = true\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif v.kind == Int {\n\t\t\t\tsawInt++\n\t\t\t\tsumInt += v.intVal\n\t\t\t} else {\n\t\t\t\tsawReal++\n\t\t\t\tsumReal += realValueOf(v)\n\t\t\t}\n\t\t}\n\t\tif sawInt == 0 {\n\t\t\tif sawReal == 0 {\n\t\t\t\treturn NullValue(), nil\n\t\t\t}\n\t\t\treturn FloatValue(sumReal), nil\n\t\t}\n\t\tall := [...]int{0} // no-op placeholder to force a clean branch below\n\t\t_ = all\n\t\tif sawReal == 0 {\n\t\t\treturn IntValue(sumInt), nil\n\t\t}\n\t\treturn FloatValue(sumReal + float64(sumInt)), nil\n\tcase \"AVG\":\n\t\tvar sum float64\n\t\tvar n int64\n\t\tfor _, v := range aggValues(agg, groupRows, cols) {\n\t\t\tif v.kind == Null {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tsum += realValueOf(v)\n\t\t\tn++\n\t\t}\n\t\tif n == 0 {\n\t\t\treturn NullValue(), nil\n\t\t}\n\t\treturn FloatValue(sum / float64(n)), nil\n\tcase \"MIN\", \"MAX\":\n\t\tvar best Value\n\t\tbest = NullValue()\n\t\thasBest := false\n\t\tfor _, v := range aggValues(agg, groupRows, cols) {\n\t\t\tif v.kind == Null {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif !hasBest {\n\t\t\t\tbest = v\n\t\t\t\thasBest = true\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tc := compareValues(best, v)\n\t\t\tif agg.funcName == \"MIN\" && c > 0 || agg.funcName == \"MAX\" && c < 0 {\n\t\t\t\tbest = v\n\t\t\t}\n\t\t}\n\t\tif !hasBest {\n\t\t\treturn NullValue(), nil\n\t\t}\n\t\treturn best, nil\n\t}\n\treturn Value{}, &SQLError{Message: \"unknown aggregate \" + agg.funcName}\n}\n\n// aggValues returns the argument values of an aggregate over a group, honoring\n// the DISTINCT modifier (NULL values are always excluded, matching SQLite's\n// COUNT(DISTINCT x) and SUM(DISTINCT x)).\nfunc aggValues(agg *AggExpr, rows [][]Value, cols []Column) []Value {\n\tvar vals []Value\n\tseen := make(map[string]bool)\n\tfor _, r := range rows {\n\t\tv, err := agg.arg.eval(r, cols)\n\t\tif err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif v.kind == Null {\n\t\t\tcontinue\n\t\t}\n\t\tif agg.distinct {\n\t\t\tk := v.RenderCLI()\n\t\t\tif seen[k] {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tseen[k] = true\n\t\t}\n\t\tvals = append(vals, v)\n\t}\n\treturn vals\n}\n\n// evalGroupItem evaluates a rewritten SELECT-list or HAVING expression against\n// a group row. The group row is built from the group's first (representative)\n// source row padded to the full schema width with slots appended for each\n// materialized aggregate, so SlotExpr can read its value and ColumnExpr can\n// read the representative key column.\nfunc evalGroupItem(expr Expr, groupRow []Value, cols []Column) (Value, error) {\n\treturn expr.eval(groupRow, cols)\n}\n\n// resolveColumnAffinity walks an expression tree and fills in the affinity of
+// matchColumns returns the index of the first column matching a (possibly
+// qualified) column name, or -1. An unqualified name matches by name alone; a
+// qualified name must also match the column's source qualifier.
+func matchColumns(name, qual string, cols []Column) int {
+	for i, c := range cols {
+		if !strings.EqualFold(c.Name, name) {
+			continue
+		}
+		if qual != "" && !strings.EqualFold(c.Qual, qual) {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+// resolveColumnAffinity walks an expression tree and fills in the affinity of
 // every ColumnExpr from the statement's table schema. It is called after
 // parsing, once the target table is known, and reports unknown columns the
 // way SQLite does at prepare time (regardless of row count).
 func resolveColumnAffinity(e Expr, cols []Column) error {
 	switch n := e.(type) {
 	case *ColumnExpr:
-		for _, c := range cols {
-			if strings.EqualFold(c.Name, n.name) {
-				n.aff = columnAffinity(c.Type)
+		if idx := matchColumns(n.name, n.qual, cols); idx >= 0 {
+			n.aff = columnAffinity(cols[idx].Type)
+			return nil
+		}
+		// Correlated subquery: if the column is not in this SELECT's own FROM,
+		// fall back to the immediately enclosing query's columns.
+		if len(outerColsStack) > 0 {
+			oc := outerColsStack[len(outerColsStack)-1]
+			if idx := matchColumns(n.name, n.qual, oc); idx >= 0 {
+				n.aff = columnAffinity(oc[idx].Type)
+				n.outer = true
+				n.outerIdx = idx
 				return nil
 			}
 		}

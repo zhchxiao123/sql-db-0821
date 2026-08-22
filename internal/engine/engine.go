@@ -11,6 +11,7 @@ import "strings"
 type Column struct {
 	Name string
 	Type string // declared type, upper-cased: INTEGER, TEXT, REAL, VARCHAR, ...
+	Qual string // source qualifier (table name or alias) in a joined FROM; "" for a plain table column
 }
 
 // Table is an in-memory table: a fixed column list plus rows of values.
@@ -55,7 +56,7 @@ func (e *Engine) Execute(sql string) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &parser{toks: toks}
+	p := &parser{toks: toks, e: e}
 	kw := strings.ToUpper(p.peek().text)
 	switch kw {
 	case "CREATE":

@@ -32,22 +32,14 @@ type token struct {
 // does not allow. LIKE/GLOB/BETWEEN/IN/IS/NOT/AND/OR are deliberately absent:
 // they are part of the expression subset.
 var unsupportedKeywords = map[string]string{
-	"JOIN":     "JOIN",
-	"INNER":    "JOIN",
-	"LEFT":     "JOIN",
-	"RIGHT":    "JOIN",
-	"FULL":     "JOIN",
-	"CROSS":    "JOIN",
-	"UNION":    "UNION",
-	"INTERSECT": "UNION",
-	"EXCEPT":   "UNION",
-	"CASE":     "CASE expression",
-	"WHEN":     "CASE expression",
-	"THEN":     "CASE expression",
-	"ELSE":     "CASE expression",
-	"END":      "CASE expression",
-	"EXISTS":   "EXISTS subquery",
-	"INDEX":    "CREATE INDEX",
+	"RIGHT":       "JOIN",
+	"FULL":        "JOIN",
+	"CASE":        "CASE expression",
+	"WHEN":        "CASE expression",
+	"THEN":        "CASE expression",
+	"ELSE":        "CASE expression",
+	"END":         "CASE expression",
+	"INDEX":       "CREATE INDEX",
 	"ALTER":       "ALTER TABLE",
 	"VIEW":        "VIEW",
 	"TRANSACTION": "transaction",
@@ -85,7 +77,7 @@ func isIdentPart(c byte) bool {
 }
 
 // tokenize splits SQL text into tokens. String literals use single quotes
-// with '' as the escaped quote, blob literals use X'hex', and == is accepted
+// with ” as the escaped quote, blob literals use X'hex', and == is accepted
 // as an alias for =, all matching SQLite.
 func tokenize(sql string) ([]token, error) {
 	var toks []token
@@ -186,10 +178,12 @@ func tokenize(sql string) ([]token, error) {
 	return toks, nil
 }
 
-// parser walks a token stream for one statement.
+// parser walks a token stream for one statement. e carries the engine so
+// subquery expressions can defer execution until eval.
 type parser struct {
 	toks []token
 	pos  int
+	e    *Engine
 }
 
 func (p *parser) peek() token { return p.toks[p.pos] }
@@ -528,120 +522,37 @@ func containsCountStar(e Expr) bool {
 	return false
 }
 
-// parseSelect handles a full single-table SELECT: select list, FROM+WHERE,
-// GROUP BY, HAVING, ORDER BY (ordinal or expression keys, ASC/DESC, NULL
-// placement), LIMIT/OFFSET and DISTINCT. An aggregate query (one with GROUP BY
-// or an aggregate in the select list or HAVING) computes one output row per
-// group; a without-FROM SELECT supplies a single constant row so COUNT(*)=1.
+// parseSelect parses a SELECT that may be a compound (UNION/INTERSECT/EXCEPT).
+// It parses the first arm, then chains any following compound operators,
+// merging rows with SQLite's duplicate semantics. ORDER BY and LIMIT/OFFSET
+// apply to the whole compound result (they cannot appear mid-compound in
+// SQLite, only after the last arm), so they are parsed and applied here after
+// the merge loop rather than inside each arm.
 func (e *Engine) parseSelect(p *parser) (*Result, error) {
-	p.next() // SELECT
-	distinct := false
-	if p.isKeyword("ALL") {
-		p.next()
-	} else if p.isKeyword("DISTINCT") {
-		p.next()
-		distinct = true
+	first, err := e.parseSelectCore(p)
+	if err != nil {
+		return nil, err
 	}
-	star := false
-	if p.peek().text == "*" {
-		p.next()
-		star = true
-	}
-	var items []selectItem
-	if !star {
-		for {
-			expr, err := p.parseExpr()
-			if err != nil {
-				return nil, err
-			}
-			name := exprName(expr)
-			if p.isKeyword("AS") {
-				p.next()
-				an, err := p.expectIdent()
-				if err != nil {
-					return nil, err
-				}
-				name = an
-			} else if t := p.peek(); t.kind == tokIdent && !selectStopKeywords[strings.ToUpper(t.text)] {
-				p.next()
-				name = t.text
-			}
-			items = append(items, selectItem{expr: expr, name: name})
-			if p.peek().text == "," {
-				p.next()
-				continue
-			}
+	for {
+		// A bare "ALL" after the first arm (e.g. `SELECT .. ALL ...`) is not a
+		// compound operator; only UNION ALL / UNION / INTERSECT / EXCEPT count.
+		if p.isKeyword("ALL") {
 			break
 		}
-	}
-	var tbl *Table
-	var cond Expr
-	var err error
-	if p.isKeyword("FROM") {
-		p.next()
-		name, err := p.expectIdent()
-		if err != nil {
-			return nil, err
-		}
-		switch p.peek().text {
-		case ",":
-			return nil, &UnsupportedError{Feature: "JOIN"}
-		case ".":
-			return nil, &UnsupportedError{Feature: "qualified column reference"}
-		case "(":
-			return nil, &UnsupportedError{Feature: "subquery in FROM"}
-		}
-		if p.isKeyword("JOIN") {
-			return nil, &UnsupportedError{Feature: "JOIN"}
-		}
-		if p.isKeyword("WHERE") {
-			p.next()
-			cond, err = p.parseExpr()
-			if err != nil {
-				return nil, err
-			}
-		}
-		var ok bool
-		tbl, ok = e.tables[name]
+		kind, ok := peekCompoundKind(p)
 		if !ok {
-			return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
-		}
-	}
-	cols := []Column(nil)
-	if tbl != nil {
-		cols = tbl.Columns
-	}
-	// GROUP BY expr [, ...]
-	var groupBy []Expr
-	if p.isKeyword("GROUP") {
-		p.next()
-		if !p.isKeyword("BY") {
-			return nil, &SQLError{Message: "expected BY after GROUP"}
-		}
-		p.next()
-		for {
-			g, err := p.parseExpr()
-			if err != nil {
-				return nil, err
-			}
-			groupBy = append(groupBy, g)
-			if p.peek().text == "," {
-				p.next()
-				continue
-			}
 			break
 		}
-	}
-	// HAVING expr
-	var having Expr
-	if p.isKeyword("HAVING") {
-		p.next()
-		having, err = p.parseExpr()
+		rest, err := e.parseSelectCore(p)
+		if err != nil {
+			return nil, err
+		}
+		first, err = mergeCompound(first, rest, kind)
 		if err != nil {
 			return nil, err
 		}
 	}
-	// ORDER BY term [ASC|DESC] [, ...]
+	// ORDER BY term [ASC|DESC] [, ...] -- applies to the whole compound result.
 	var order []orderTerm
 	if p.isKeyword("ORDER") {
 		p.next()
@@ -679,7 +590,7 @@ func (e *Engine) parseSelect(p *parser) (*Result, error) {
 			break
 		}
 	}
-	// LIMIT n [OFFSET m] | LIMIT n, m | OFFSET m
+	// LIMIT n [OFFSET m] | LIMIT n, m | OFFSET m -- whole-compound scope.
 	var limit, offset int
 	haveLimit := false
 	if p.isKeyword("LIMIT") {
@@ -724,11 +635,140 @@ func (e *Engine) parseSelect(p *parser) (*Result, error) {
 	if err := p.checkTrailing(); err != nil {
 		return nil, err
 	}
+	outRows := first.Rows
+	if len(order) > 0 {
+		outCols := make([]Column, len(first.Columns))
+		for i, n := range first.Columns {
+			outCols[i] = Column{Name: n}
+		}
+		if serr := sortRowsByKeys(outRows, outCols, order); serr != nil {
+			return nil, serr
+		}
+	}
+	if haveLimit {
+		off := offset
+		if off < 0 {
+			off = 0
+		}
+		if off > len(outRows) {
+			outRows = nil
+		} else {
+			outRows = outRows[off:]
+		}
+		if limit >= 0 && limit < len(outRows) {
+			outRows = outRows[:limit]
+		}
+	}
+	return &Result{Columns: first.Columns, Rows: outRows}, nil
+}
+
+// parseSelectCore handles a full single-SELECT (non-compound) core: select list,
+// FROM+WHERE, GROUP BY, HAVING, ORDER BY (ordinal or expression keys, ASC/DESC,
+// NULL placement), LIMIT/OFFSET and DISTINCT. An aggregate query (one with GROUP
+// BY or an aggregate in the select list or HAVING) computes one output row per
+// group; a without-FROM SELECT supplies a single constant row so COUNT(*)=1.
+func (e *Engine) parseSelectCore(p *parser) (*Result, error) {
+	p.next() // SELECT
+	distinct := false
+	if p.isKeyword("ALL") {
+		p.next()
+	} else if p.isKeyword("DISTINCT") {
+		p.next()
+		distinct = true
+	}
+	star := false
+	if p.peek().text == "*" {
+		p.next()
+		star = true
+	}
+	var items []selectItem
+	if !star {
+		for {
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			name := exprName(expr)
+			if p.isKeyword("AS") {
+				p.next()
+				an, err := p.expectIdent()
+				if err != nil {
+					return nil, err
+				}
+				name = an
+			} else if t := p.peek(); t.kind == tokIdent && !selectStopKeywords[strings.ToUpper(t.text)] {
+				p.next()
+				name = t.text
+			}
+			items = append(items, selectItem{expr: expr, name: name})
+			if p.peek().text == "," {
+				p.next()
+				continue
+			}
+			break
+		}
+	}
+	// FROM: a single table, a comma-separated cross product, or JOINs and
+	// derived-subsets. parseFrom returns the combined column list (each tagged
+	// with its source qualifier) plus the joined rows.
+	var joined *joinedFrom
+	var cond Expr
+	var err error
+	if p.isKeyword("FROM") {
+		p.next()
+		joined, err = e.parseFrom(p)
+		if err != nil {
+			return nil, err
+		}
+		if p.isKeyword("WHERE") {
+			p.next()
+			cond, err = p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	cols := []Column(nil)
+	if joined != nil {
+		cols = joined.cols
+	}
+	// GROUP BY expr [, ...]
+	var groupBy []Expr
+	if p.isKeyword("GROUP") {
+		p.next()
+		if !p.isKeyword("BY") {
+			return nil, &SQLError{Message: "expected BY after GROUP"}
+		}
+		p.next()
+		for {
+			g, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			groupBy = append(groupBy, g)
+			if p.peek().text == "," {
+				p.next()
+				continue
+			}
+			break
+		}
+	}
+	// HAVING expr
+	var having Expr
+	if p.isKeyword("HAVING") {
+		p.next()
+		having, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+	// ORDER BY and LIMIT/OFFSET apply to the whole compound result and are
+	// parsed by parseSelect after the merge loop, so nothing is consumed here.
 	if star {
-		if tbl == nil {
+		if joined == nil {
 			return nil, &SQLError{Message: "SELECT * requires a FROM clause"}
 		}
-		for _, c := range tbl.Columns {
+		for _, c := range joined.cols {
 			items = append(items, selectItem{expr: &ColumnExpr{name: c.Name}, name: c.Name})
 		}
 	}
@@ -771,9 +811,9 @@ func (e *Engine) parseSelect(p *parser) (*Result, error) {
 	// WHERE-filtered source rows (or a single constant row when there is no
 	// FROM).
 	var condRows [][]Value
-	if tbl != nil {
-		for _, row := range tbl.Rows {
-			if cond != nil && !condTrue(cond, row, tbl.Columns) {
+	if joined != nil {
+		for _, row := range joined.rows {
+			if cond != nil && !condTrue(cond, row, joined.cols) {
 				continue
 			}
 			condRows = append(condRows, row)
@@ -878,29 +918,8 @@ func (e *Engine) parseSelect(p *parser) (*Result, error) {
 	if distinct {
 		outRows = dedupRows(outRows)
 	}
-	if len(order) > 0 {
-		outCols := make([]Column, len(items))
-		for i, it := range items {
-			outCols[i] = Column{Name: it.name}
-		}
-		if serr := sortRowsByKeys(outRows, outCols, order); serr != nil {
-			return nil, serr
-		}
-	}
-	if haveLimit {
-		off := offset
-		if off < 0 {
-			off = 0
-		}
-		if off > len(outRows) {
-			outRows = nil
-		} else {
-			outRows = outRows[off:]
-		}
-		if limit >= 0 && limit < len(outRows) {
-			outRows = outRows[:limit]
-		}
-	}
+	// ORDER BY and LIMIT/OFFSET are applied by parseSelect on the whole
+	// compound result; the core returns the raw rows.
 	colNames := make([]string, len(items))
 	for i, it := range items {
 		colNames[i] = it.name
