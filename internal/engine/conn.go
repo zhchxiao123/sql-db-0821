@@ -104,6 +104,10 @@ func (t *Table) clone() *Table {
 	for i := range t.Rows {
 		cp.Rows[i] = append([]Value(nil), t.Rows[i]...)
 	}
+	cp.UniqueKeys = make([][]string, len(t.UniqueKeys))
+	for i, g := range t.UniqueKeys {
+		cp.UniqueKeys[i] = append([]string(nil), g...)
+	}
 	return cp
 }
 

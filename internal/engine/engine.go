@@ -23,17 +23,23 @@ type Column struct {
 	Type    string // declared type, upper-cased: INTEGER, TEXT, REAL, VARCHAR, ...
 	NotNull bool   // declared NOT NULL; a NULL insert fails
 	Unique  bool   // declared UNIQUE or PRIMARY KEY; duplicate non-NULL rows fail
+	PrimaryKey bool // declared PRIMARY KEY (distinct from UNIQUE for sqlite_master)
 	Default Expr   // DEFAULT value/expression; nil = none (omitted columns become NULL)
 	Check   Expr   // CHECK(...) expression; nil = none
 }
 
 // Table is an in-memory table: a fixed column list plus rows of values.
 // SQL keeps the original CREATE TABLE text so sqlite_master can report it.
+// UniqueKeys holds composite UNIQUE / PRIMARY KEY column groups declared at
+// table level (e.g. PRIMARY KEY (a, b)); each group is unique as a whole, not
+// column by column. A single-column table-level key is equivalent to marking
+// that column Unique.
 type Table struct {
-	Name    string
-	Columns []Column
-	Rows    [][]Value
-	SQL     string // original CREATE TABLE statement
+	Name       string
+	Columns    []Column
+	Rows       [][]Value
+	UniqueKeys [][]string // table-level UNIQUE/PRIMARY KEY column groups
+	SQL        string     // original CREATE TABLE statement
 }
 
 // Index describes a CREATE [UNIQUE] INDEX: the owning table, the ordered

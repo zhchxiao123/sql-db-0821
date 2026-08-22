@@ -297,6 +297,7 @@ func (p *parser) parseColumnConstraints(col *Column) error {
 			}
 			p.next()
 			col.Unique = true
+			col.PrimaryKey = true
 		case "NOT":
 			p.next()
 			if !strings.EqualFold(p.peek().text, "NULL") {
@@ -493,23 +494,30 @@ func parseCreate(p *parser, tbls map[string]*Table, idxs map[string]*Index) (*Re
 	if _, exists := tbls[name]; exists {
 		return nil, &SQLError{Message: fmt.Sprintf("table %q already exists", name)}
 	}
-	// Apply table-level PRIMARY KEY/UNIQUE to their columns (marked Unique).
-	for _, cn := range pkCols {
-		if i := tableColumnSeq(cols).index(cn); i >= 0 {
-			cols[i].Unique = true
-		} else {
-			return nil, &SQLError{Message: fmt.Sprintf("no such column: %s", cn)}
+	// Collect table-level PRIMARY KEY/UNIQUE into composite key groups. A
+	// single-column group is equivalent to marking that column Unique (SQLite
+	// reports the duplicate as UNIQUE constraint failed); a multi-column group
+	// is unique as a whole and enforced in parseInsert against the group.
+	var uniqueKeys [][]string
+	for _, g := range [][]string{pkCols, uniqueCols} {
+		if len(g) == 0 {
+			continue
 		}
-	}
-	for _, cn := range uniqueCols {
-		if i := tableColumnSeq(cols).index(cn); i >= 0 {
-			cols[i].Unique = true
-		} else {
-			return nil, &SQLError{Message: fmt.Sprintf("no such column: %s", cn)}
+		for _, cn := range g {
+			if tableColumnSeq(cols).index(cn) < 0 {
+				return nil, &SQLError{Message: fmt.Sprintf("no such column: %s", cn)}
+			}
 		}
+		if len(g) == 1 {
+			if i := tableColumnSeq(cols).index(g[0]); i >= 0 {
+				cols[i].Unique = true
+				continue
+			}
+		}
+		uniqueKeys = append(uniqueKeys, g)
 	}
-	sqlText := renderCreateTableSQL(p, sqlStart, name, cols)
-	tbls[name] = &Table{Name: name, Columns: cols, SQL: sqlText}
+	sqlText := renderCreateTableSQL(p, sqlStart, name, cols, uniqueKeys)
+	tbls[name] = &Table{Name: name, Columns: cols, UniqueKeys: uniqueKeys, SQL: sqlText}
 	return &Result{}, nil
 }
 
@@ -587,7 +595,7 @@ func parseCreateIndex(p *parser, idxs map[string]*Index, unique bool) (*Result, 
 // renderCreateTableSQL synthesizes the original CREATE TABLE text from the
 // parsed definition, so sqlite_master can report a stable definition even when
 // the engine reconstructed it (e.g. after reload).
-func renderCreateTableSQL(p *parser, sqlStart int, name string, cols []Column) string {
+func renderCreateTableSQL(p *parser, sqlStart int, name string, cols []Column, uniqueKeys [][]string) string {
 	var b strings.Builder
 	b.WriteString("CREATE TABLE ")
 	b.WriteString(name)
@@ -600,7 +608,9 @@ func renderCreateTableSQL(p *parser, sqlStart int, name string, cols []Column) s
 		if c.NotNull {
 			b.WriteString(" NOT NULL")
 		}
-		if c.Unique {
+		if c.PrimaryKey {
+			b.WriteString(" PRIMARY KEY")
+		} else if c.Unique {
 			b.WriteString(" UNIQUE")
 		}
 		if c.Default != nil {
@@ -612,7 +622,21 @@ func renderCreateTableSQL(p *parser, sqlStart int, name string, cols []Column) s
 			b.WriteString(exprRender(c.Check))
 			b.WriteString(")")
 		}
-		if i < len(cols)-1 {
+		if i < len(cols)-1 || len(uniqueKeys) > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+	for i, g := range uniqueKeys {
+		b.WriteString("  UNIQUE (")
+		for j, cn := range g {
+			b.WriteString(cn)
+			if j < len(g)-1 {
+				b.WriteString(", ")
+			}
+		}
+		b.WriteString(")")
+		if i < len(uniqueKeys)-1 {
 			b.WriteString(",")
 		}
 		b.WriteString("\n")
@@ -736,6 +760,9 @@ func parseAlter(p *parser, tbls map[string]*Table, idxs map[string]*Index) (*Res
 		if isPrimaryKeyColumn(col) {
 			return nil, &SQLError{Message: "Cannot add a PRIMARY KEY column"}
 		}
+		if col.Unique {
+			return nil, &SQLError{Message: "Cannot add a UNIQUE column"}
+		}
 		tbl.Columns = append(tbl.Columns, col)
 		// Back-fill existing rows with the new column's default.
 		for i := range tbl.Rows {
@@ -771,54 +798,41 @@ func parseStoredTableSQL(sql string) (*Table, error) {
 		return nil, err
 	}
 	var cols []Column
+	var uniqueKeys [][]string
 	for {
 		kw := strings.ToUpper(p.peek().text)
 		if p.peek().kind == tokIdent && (kw == "PRIMARY" || kw == "UNIQUE") {
+			p.next()
 			if kw == "PRIMARY" {
-				p.next()
 				p.next() // KEY
-				if err := p.expectPunct("("); err != nil {
+			}
+			if err := p.expectPunct("("); err != nil {
+				return nil, err
+			}
+			var g []string
+			for {
+				cn, err := p.expectIdent()
+				if err != nil {
 					return nil, err
 				}
-				for {
-					cn, err := p.expectIdent()
-					if err != nil {
-						return nil, err
-					}
-					if i := tableColumnSeq(cols).index(cn); i >= 0 {
-						cols[i].Unique = true
-					}
-					if p.peek().text == "," {
-						p.next()
-						continue
-					}
-					break
+				g = append(g, cn)
+				if p.peek().text == "," {
+					p.next()
+					continue
 				}
-				if err := p.expectPunct(")"); err != nil {
-					return nil, err
+				break
+			}
+			if err := p.expectPunct(")"); err != nil {
+				return nil, err
+			}
+			// Mirror parseCreate's folding: a single-column group marks that
+			// column Unique; a multi-column group is unique as a whole.
+			if len(g) == 1 {
+				if i := tableColumnSeq(cols).index(g[0]); i >= 0 {
+					cols[i].Unique = true
 				}
-			} else { // UNIQUE
-				p.next()
-				if err := p.expectPunct("("); err != nil {
-					return nil, err
-				}
-				for {
-					cn, err := p.expectIdent()
-					if err != nil {
-						return nil, err
-					}
-					if i := tableColumnSeq(cols).index(cn); i >= 0 {
-						cols[i].Unique = true
-					}
-					if p.peek().text == "," {
-						p.next()
-						continue
-					}
-					break
-				}
-				if err := p.expectPunct(")"); err != nil {
-					return nil, err
-				}
+			} else {
+				uniqueKeys = append(uniqueKeys, g)
 			}
 		} else {
 			colName, err := p.expectIdent()
@@ -851,15 +865,12 @@ func parseStoredTableSQL(sql string) (*Table, error) {
 	if err := p.expectPunct(")"); err != nil {
 		return nil, err
 	}
-	return &Table{Name: name, Columns: cols, SQL: sql}, nil
+	return &Table{Name: name, Columns: cols, UniqueKeys: uniqueKeys, SQL: sql}, nil
 }
 
-// isPrimaryKeyColumn reports whether a column was declared PRIMARY KEY. The
-// engine records PRIMARY KEY as Unique (indistinguishable from UNIQUE); ADD
-// COLUMN rejection uses this conservative rule: a NULL-defaulted column cannot
-// be UNIQUE either, so rejecting Unique-with-NULL-default is safe for both.
+// isPrimaryKeyColumn reports whether a column was declared PRIMARY KEY.
 func isPrimaryKeyColumn(col Column) bool {
-	return col.Unique && col.Default == nil
+	return col.PrimaryKey
 }
 
 // rewriteSQLTableName replaces the first table-name occurrence in a stored SQL
@@ -1025,6 +1036,27 @@ func parseInsert(p *parser, tbls map[string]*Table, idxs map[string]*Index) (*Re
 			if columnHasEqualValue(tbl, tbl.Columns[i].Name, row) {
 				return nil, &SQLError{Message: fmt.Sprintf("UNIQUE constraint failed: %s.%s", name, tbl.Columns[i].Name)}
 			}
+		}
+	}
+	// A table-level PRIMARY KEY / UNIQUE group (composite key) is unique as a
+	// whole: the row conflicts only when every member of the group matches an
+	// existing row. NULL in any member never conflicts, as in SQLite.
+	for _, g := range tbl.UniqueKeys {
+		pos := make([]int, len(g))
+		valid := true
+		for j, cn := range g {
+			pi := tbl.columnIndex(cn)
+			if pi < 0 {
+				valid = false
+				break
+			}
+			pos[j] = pi
+		}
+		if !valid || indexKeyHasNull(pos, row) {
+			continue
+		}
+		if indexHasEqualRow(tbl, pos, row) {
+			return nil, &SQLError{Message: fmt.Sprintf("UNIQUE constraint failed: %s.%s", name, strings.Join(g, ", "))}
 		}
 	}
 	// A UNIQUE INDEX enforces the same rule across its whole column list. As in
@@ -1211,7 +1243,7 @@ func buildSQLiteMaster(tbls map[string]*Table, idxs map[string]*Index) *Table {
 	for _, t := range tbls {
 		sql := t.SQL
 		if sql == "" {
-			sql = renderCreateTableSQL(nil, 0, t.Name, t.Columns)
+			sql = renderCreateTableSQL(nil, 0, t.Name, t.Columns, t.UniqueKeys)
 		}
 		rows = append(rows, []Value{TextValue("table"), TextValue(t.Name), TextValue(t.Name), IntValue(0), TextValue(sql)})
 	}

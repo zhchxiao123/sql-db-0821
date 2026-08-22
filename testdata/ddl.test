@@ -148,3 +148,54 @@ query T
 SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'stuff'
 ----
 stuff
+
+# Composite table-level PRIMARY KEY (a, b) is unique as a group, not per-column.
+statement ok
+CREATE TABLE m (a INTEGER, b INTEGER, PRIMARY KEY (a, b))
+
+statement ok
+INSERT INTO m VALUES (1, 1)
+
+# Same first column, different second -> OK (group differs).
+statement ok
+INSERT INTO m VALUES (1, 2)
+
+# Duplicate group -> UNIQUE constraint failed (SQLite reports the column list).
+statement error
+INSERT INTO m VALUES (1, 1)
+
+query II rowsort
+SELECT a, b FROM m
+----
+1
+1
+1
+2
+
+# NULL group members never conflict.
+statement ok
+INSERT INTO m VALUES (NULL, NULL)
+
+statement ok
+INSERT INTO m VALUES (NULL, 1)
+
+# Composite table-level UNIQUE.
+statement ok
+CREATE TABLE n (a INTEGER, b INTEGER, UNIQUE (a, b))
+
+statement ok
+INSERT INTO n VALUES (1, 1)
+
+statement ok
+INSERT INTO n VALUES (1, 2)
+
+statement error
+INSERT INTO n VALUES (1, 2)
+
+query II rowsort
+SELECT a, b FROM n
+----
+1
+1
+1
+2

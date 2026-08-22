@@ -136,6 +136,7 @@ func loadTables(path string) (map[string]*Table, map[string]*Index, error) {
 		if pt.SQL != "" {
 			if rt, err := parseStoredTableSQL(pt.SQL); err == nil {
 				t.Columns = rt.Columns
+				t.UniqueKeys = rt.UniqueKeys
 			} else {
 				for i, pc := range pt.Columns {
 					t.Columns[i] = Column{Name: pc.Name, Type: pc.Type, NotNull: pc.NotNull, Unique: pc.Unique}
