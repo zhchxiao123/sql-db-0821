@@ -1,0 +1,150 @@
+# ddl.test — schema constraints and indexes (acceptance criteria a1-a7).
+# Constraint violations, DEFAULT (literal and expression), CREATE/UNIQUE/DROP
+# INDEX, ALTER TABLE (RENAME, ADD COLUMN), DROP TABLE and sqlite_master
+# introspection. Expected values verified against sqlite3 3.51.0.
+
+statement ok
+CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, qty INTEGER DEFAULT 1, price REAL DEFAULT 0.5, upc INTEGER DEFAULT (5 + 10))
+
+statement ok
+INSERT INTO items (id, name, price) VALUES (1, 'apple', 0.25)
+
+statement ok
+INSERT INTO items (id, name) VALUES (2, 'banana')
+
+# PRIMARY KEY duplicate -> UNIQUE constraint failure; row data unchanged.
+statement error
+INSERT INTO items (id, name) VALUES (1, 'first')
+
+statement ok
+INSERT INTO items (id, name) VALUES (3, 'apple-eat')
+
+# UNIQUE column duplicate.
+statement error
+INSERT INTO items (id, name) VALUES (4, 'banana')
+
+# NOT NULL constraint failure (name is nullable? it is NOT NULL, so NULL fails).
+statement error
+INSERT INTO items (id, name) VALUES (5, NULL)
+
+# DEFAULT evaluation: omitted qty/price/upc filled from DEFAULT (1, 0.5, 15).
+query ITIRI rowsort
+SELECT id, name, qty, price, upc FROM items
+----
+1
+apple
+1
+0.250
+15
+2
+banana
+1
+0.500
+15
+3
+apple-eat
+1
+0.500
+15
+
+statement ok
+CREATE TABLE val (a INTEGER, b INTEGER CHECK (b > 0))
+
+statement ok
+INSERT INTO val VALUES (1, 5)
+
+# CHECK violation leaves the table unchanged.
+statement error
+INSERT INTO val VALUES (2, -3)
+
+query I rowsort
+SELECT count(*) FROM val
+----
+1
+
+statement ok
+INSERT INTO val VALUES (3, 7)
+
+# CREATE INDEX / UNIQUE INDEX.
+statement ok
+CREATE INDEX idx_qty ON items (qty)
+
+statement ok
+CREATE UNIQUE INDEX uidx_name ON items (name)
+
+# A second row sharing a UNIQUE INDEX value fails.
+statement error
+INSERT INTO items (id, name) VALUES (6, 'apple')
+
+# Query result is identical before/after index creation (plan: a7).
+query I rowsort
+SELECT id FROM items WHERE name = 'apple'
+----
+1
+
+statement ok
+DROP INDEX idx_qty
+
+statement ok
+DROP INDEX uidx_name
+
+# DROP TABLE and sqlite_master introspection.
+statement ok
+CREATE TABLE tmp (x INTEGER)
+
+statement ok
+INSERT INTO tmp VALUES (1)
+
+query T
+SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name
+----
+items
+tmp
+val
+
+statement error
+SELECT x FROM tmpx_before_drop
+
+statement ok
+DROP TABLE tmp
+
+statement error
+SELECT x FROM tmp
+
+query T
+SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name
+----
+items
+val
+
+# ALTER TABLE RENAME then ADD COLUMN.
+statement ok
+ALTER TABLE items RENAME TO stuff
+
+statement error
+SELECT * FROM items
+
+query I rowsort
+SELECT qty FROM stuff WHERE name = 'apple'
+----
+1
+
+statement ok
+ALTER TABLE stuff ADD COLUMN note TEXT
+
+# Old rows see NULL in the new column (no DEFAULT).
+query TT rowsort
+SELECT name, note FROM stuff
+----
+apple
+NULL
+apple-eat
+NULL
+banana
+NULL
+
+# sqlite_master reflects the renamed table.
+query T
+SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'stuff'
+----
+stuff

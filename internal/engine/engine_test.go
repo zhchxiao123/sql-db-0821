@@ -183,10 +183,7 @@ func TestUnsupportedConstructs(t *testing.T) {
 		"SELECT coalesce(a, b) FROM t",
 		"SELECT (SELECT a FROM t) FROM t",
 		"SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t)",
-		"CREATE INDEX idx ON t (a)",
 		"CREATE VIEW v AS SELECT * FROM t",
-		"ALTER TABLE t ADD COLUMN c INTEGER",
-		"DROP INDEX idx",
 		"DROP VIEW v",
 		"PRAGMA table_info(t)",
 	}
@@ -236,13 +233,86 @@ func TestDuplicateTable(t *testing.T) {
 	execErr(t, e, "CREATE TABLE t (a INTEGER)")
 }
 
-func TestColumnConstraintsIgnored(t *testing.T) {
+func TestColumnConstraintsEnforced(t *testing.T) {
 	e := New()
-	exec(t, e, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT NOT NULL, c INTEGER UNIQUE)")
-	exec(t, e, "INSERT INTO t VALUES (1, 'x', 2)")
+	exec(t, e, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT NOT NULL, c INTEGER UNIQUE, d INTEGER CHECK (d > 0))")
+	exec(t, e, "INSERT INTO t VALUES (1, 'x', 2, 3)")
 	res := exec(t, e, "SELECT * FROM t")
-	if got := rowsText(res); len(got) != 1 || got[0] != "1|x|2" {
-		t.Errorf("constraints: got %v want [1|x|2]", got)
+	if got := rowsText(res); len(got) != 1 || got[0] != "1|x|2|3" {
+		t.Errorf("constraints: got %v want [1|x|2|3]", got)
+	}
+	// PRIMARY KEY duplicate -> UNIQUE constraint failure; data unchanged.
+	execErr(t, e, "INSERT INTO t VALUES (1, 'y', 4, 5)")
+	// UNIQUE duplicate.
+	execErr(t, e, "INSERT INTO t VALUES (9, 'z', 2, 5)")
+	// NOT NULL failure.
+	execErr(t, e, "INSERT INTO t VALUES (9, NULL, 4, 5)")
+	// CHECK failure.
+	execErr(t, e, "INSERT INTO t VALUES (9, 'z', 4, -1)")
+	res = exec(t, e, "SELECT count(*) FROM t")
+	if got := rowsText(res); len(got) != 1 || got[0] != "1" {
+		t.Errorf("constraints left data changed: got %v want [1]", got)
+	}
+	// NULLs never conflict with UNIQUE: multiple NULLs are allowed.
+	exec(t, e, "INSERT INTO t VALUES (10, 'w', NULL, 4)")
+	exec(t, e, "INSERT INTO t VALUES (11, 'v', NULL, 4)")
+}
+
+func TestDefaultsAndIndexes(t *testing.T) {
+	e := New()
+	exec(t, e, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT DEFAULT 'hi', c INTEGER DEFAULT 7, d INTEGER DEFAULT (5 + 10))")
+	exec(t, e, "INSERT INTO t (a) VALUES (1)")
+	exec(t, e, "INSERT INTO t VALUES (2, DEFAULT, DEFAULT, DEFAULT)")
+	res := exec(t, e, "SELECT * FROM t ORDER BY a")
+	if got := rowsText(res); len(got) != 2 || got[0] != "1|hi|7|15" || got[1] != "2|hi|7|15" {
+		t.Errorf("defaults: got %v want [1|hi|7|15 2|hi|7|15]", got)
+	}
+	// CREATE UNIQUE INDEX enforces uniqueness on INSERT.
+	exec(t, e, "CREATE UNIQUE INDEX uidx ON t (b)")
+	execErr(t, e, "INSERT INTO t (a) VALUES (3)")
+	res = exec(t, e, "SELECT name, tbl_name FROM sqlite_master WHERE type='index'")
+	if got := rowsText(res); len(got) != 1 || got[0] != "uidx|t" {
+		t.Errorf("sqlite_master index: got %v want [uidx|t]", got)
+	}
+	exec(t, e, "DROP INDEX uidx")
+	res = exec(t, e, "SELECT name FROM sqlite_master WHERE type='index'")
+	if len(res.Rows) != 0 {
+		t.Errorf("sqlite_master after drop index: got %d rows", len(res.Rows))
+	}
+}
+
+func TestAlterRenameAddDrop(t *testing.T) {
+	e := New()
+	exec(t, e, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+	exec(t, e, "INSERT INTO t VALUES (1, 'x')")
+	exec(t, e, "CREATE INDEX idx ON t (a)")
+	exec(t, e, "ALTER TABLE t RENAME TO t2")
+	// Index follows the renamed table.
+	res := exec(t, e, "SELECT name, tbl_name FROM sqlite_master WHERE type='index'")
+	if got := rowsText(res); len(got) != 1 || got[0] != "idx|t2" {
+		t.Errorf("index after rename: got %v want [idx|t2]", got)
+	}
+	exec(t, e, "ALTER TABLE t2 ADD COLUMN c INTEGER DEFAULT 9")
+	res = exec(t, e, "SELECT a, b, c FROM t2")
+	if got := rowsText(res); len(got) != 1 || got[0] != "1|x|9" {
+		t.Errorf("add column default: got %v want [1|x|9]", got)
+	}
+	exec(t, e, "ALTER TABLE t2 ADD COLUMN note TEXT") // no default -> old rows NULL
+	res = exec(t, e, "SELECT note FROM t2")
+	if got := rowsText(res); len(got) != 1 || got[0] != "NULL" {
+		t.Errorf("add column no default: got %v want [NULL]", got)
+	}
+	execErr(t, e, "ALTER TABLE t2 ADD COLUMN bad INTEGER NOT NULL") // cannot add NOT NULL w/ NULL default
+	execErr(t, e, "ALTER TABLE t2 ADD COLUMN pk INTEGER PRIMARY KEY")
+	res = exec(t, e, "SELECT name FROM sqlite_master WHERE type='table'")
+	if got := rowsText(res); len(got) != 1 || got[0] != "t2" {
+		t.Errorf("sqlite_master: got %v want [t2]", got)
+	}
+	exec(t, e, "DROP TABLE t2")
+	execErr(t, e, "SELECT a FROM t2")
+	res = exec(t, e, "SELECT name FROM sqlite_master")
+	if len(res.Rows) != 0 {
+		t.Errorf("sqlite_master after drop: got %d rows", len(res.Rows))
 	}
 }
 
