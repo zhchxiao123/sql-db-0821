@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -46,6 +47,23 @@ func (e *ColumnExpr) eval(row []Value, cols []Column) (Value, error) {
 	}
 	return Value{}, &SQLError{Message: fmt.Sprintf("no such column: %s", e.name)}
 }
+
+// SlotExpr references a materialized aggregate value computed once per group.
+// The statement parser rewrites each AggExpr into a SlotExpr whose index
+// points at a per-group aggregate result; the group row stored those results
+// after the source-column section so the normal evaluator can read them.
+type SlotExpr struct {
+	slot int
+}
+
+func (e *SlotExpr) eval(row []Value, cols []Column) (Value, error) {
+	if e.slot < 0 || len(cols)+e.slot >= len(row) {
+		return Value{}, &SQLError{Message: "aggregate slot out of range"}
+	}
+	return row[len(cols)+e.slot], nil
+}
+
+func (e *SlotExpr) affinity() Affinity { return AffNone }
 
 func (e *ColumnExpr) affinity() Affinity { return e.aff }
 
@@ -329,16 +347,543 @@ func (e *LikeExpr) eval(row []Value, cols []Column) (Value, error) {
 
 func (e *LikeExpr) affinity() Affinity { return AffNone }
 
-// CountStarExpr is the marker for COUNT(*) in a SELECT list. In a constant
-// SELECT (no FROM) it evaluates to 1, matching SQLite; with FROM the
-// statement parser handles it as a row count.
-type CountStarExpr struct{}
+// AggExpr is an aggregate function application in a SELECT list or HAVING
+// clause: COUNT(*), COUNT(expr), SUM(expr), AVG(expr), MIN(expr), MAX(expr),
+// with an optional ALL/DISTINCT modifier. It is a marker node: it cannot be
+// evaluated against a single row; the statement parser collects all AggExpr
+// nodes in a query, materializes per-group values, then evaluates the
+// surrounding expressions against the group context.
+type AggExpr struct {
+	funcName string // COUNT, SUM, AVG, MIN, MAX
+	arg      Expr   // nil for COUNT(*)
+	star     bool   // true for COUNT(*)
+	distinct bool   // DISTINCT modifier
+}
+
+func (e *AggExpr) eval(row []Value, cols []Column) (Value, error) {
+	return Value{}, &SQLError{Message: "aggregate outside group context"}
+}
+
+func (e *AggExpr) affinity() Affinity { return AffNone }
+
+// CountStarExpr is kept as a thin alias used only for textual classification
+// of a bare COUNT(*); parsing now produces an AggExpr for every aggregate. It
+// is retained so older switches still type-check.
+type CountStarExpr struct {
+	agg AggExpr
+}
 
 func (e *CountStarExpr) eval(row []Value, cols []Column) (Value, error) {
-	return IntValue(1), nil
+	return Value{}, &SQLError{Message: "aggregate outside group context"}
 }
 
 func (e *CountStarExpr) affinity() Affinity { return AffNone }
+
+// collectAggregates walks an expression tree and appends every AggExpr node
+// found to dst, marking which are nested inside another aggregate (so an
+// aggregate is never treated as the argument of another aggregate).
+func collectAggregates(e Expr, dst []*AggExpr, inAgg bool) []*AggExpr {
+	switch n := e.(type) {
+	case *AggExpr:
+		if !inAgg {
+			dst = append(dst, n)
+		}
+		if n.arg != nil {
+			dst = collectAggregates(n.arg, dst, true)
+		}
+	case *CastExpr:
+		dst = collectAggregates(n.inner, dst, inAgg)
+	case *ArithExpr:
+		dst = collectAggregates(n.left, dst, inAgg)
+		dst = collectAggregates(n.right, dst, inAgg)
+	case *NegExpr:
+		dst = collectAggregates(n.inner, dst, inAgg)
+	case *CompareExpr:
+		dst = collectAggregates(n.left, dst, inAgg)
+		dst = collectAggregates(n.right, dst, inAgg)
+	case *LogicalExpr:
+		dst = collectAggregates(n.left, dst, inAgg)
+		dst = collectAggregates(n.right, dst, inAgg)
+	case *NotExpr:
+		dst = collectAggregates(n.inner, dst, inAgg)
+	case *InExpr:
+		dst = collectAggregates(n.left, dst, inAgg)
+		for _, item := range n.list {
+			dst = collectAggregates(item, dst, inAgg)
+		}
+	case *BetweenExpr:
+		dst = collectAggregates(n.left, dst, inAgg)
+		dst = collectAggregates(n.low, dst, inAgg)
+		dst = collectAggregates(n.high, dst, inAgg)
+	case *LikeExpr:
+		dst = collectAggregates(n.left, dst, inAgg)
+		dst = collectAggregates(n.pattern, dst, inAgg)
+		if n.escape != nil {
+			dst = collectAggregates(n.escape, dst, inAgg)
+		}
+	}
+	return dst
+}
+
+// hasAggregate reports whether an expression tree contains any aggregate node.
+func hasAggregate(e Expr) bool {
+	return len(collectAggregates(e, nil, false)) > 0
+}
+
+// replaceAggregates rewrites each AggExpr in an expression tree into a
+// SlotExpr holding the aggregate's index, returning the rewritten expression
+// and the list of aggregates in evaluation order. Aggregates nested inside
+// another aggregate's argument are not replaced (SQLite rejects nested
+// aggregates).
+func replaceAggregates(e Expr, dst []*AggExpr, inAgg bool) (Expr, []*AggExpr) {
+	switch n := e.(type) {
+	case *AggExpr:
+		if inAgg {
+			return n, dst
+		}
+		idx := len(dst)
+		dst = append(dst, n)
+		dst = collectAggregates(n.arg, dst, true)
+		return &SlotExpr{slot: idx}, dst
+	case *CastExpr:
+		inner, d := replaceAggregates(n.inner, dst, inAgg)
+		n.inner = inner
+		return n, d
+	case *ArithExpr:
+		l, d := replaceAggregates(n.left, dst, inAgg)
+		n.left = l
+		r, d := replaceAggregates(n.right, d, inAgg)
+		n.right = r
+		return n, d
+	case *NegExpr:
+		inner, d := replaceAggregates(n.inner, dst, inAgg)
+		n.inner = inner
+		return n, d
+	case *CompareExpr:
+		l, d := replaceAggregates(n.left, dst, inAgg)
+		n.left = l
+		r, d := replaceAggregates(n.right, d, inAgg)
+		n.right = r
+		return n, d
+	case *LogicalExpr:
+		l, d := replaceAggregates(n.left, dst, inAgg)
+		n.left = l
+		r, d := replaceAggregates(n.right, d, inAgg)
+		n.right = r
+		return n, d
+	case *NotExpr:
+		inner, d := replaceAggregates(n.inner, dst, inAgg)
+		n.inner = inner
+		return n, d
+	case *InExpr:
+		l, d := replaceAggregates(n.left, dst, inAgg)
+		n.left = l
+		for i, item := range n.list {
+			item, d = replaceAggregates(item, d, inAgg)
+			n.list[i] = item
+		}
+		return n, d
+	case *BetweenExpr:
+		l, d := replaceAggregates(n.left, dst, inAgg)
+		n.left = l
+		lo, d := replaceAggregates(n.low, d, inAgg)
+		n.low = lo
+		hi, d := replaceAggregates(n.high, d, inAgg)
+		n.high = hi
+		return n, d
+	case *LikeExpr:
+		l, d := replaceAggregates(n.left, dst, inAgg)
+		n.left = l
+		p, d := replaceAggregates(n.pattern, d, inAgg)
+		n.pattern = p
+		if n.escape != nil {
+			n.escape, d = replaceAggregates(n.escape, d, inAgg)
+		}
+		return n, d
+	}
+	return e, dst
+}
+
+// groupByString renders a group key as a string for partitioning. Rows whose
+// key columns are equal (including NULL == NULL) share a group, matching
+// SQLite's GROUP BY which treats every NULL as equal. The rendered value
+// distinguishes NULL from a literal empty text so the two never merge.
+func groupKeyString(row []Value, keyIdx []int) string {
+	var sb strings.Builder
+	for _, i := range keyIdx {
+		v := row[i]
+		if v.kind == Null {
+			sb.WriteString("\x00NULL\x01")
+			continue
+		}
+		sb.WriteString("\x00")
+		sb.WriteString(v.RenderCLI())
+		sb.WriteString("\x01")
+	}
+	return sb.String()
+}
+
+// partitionGroups splits condRows into groups by their key columns. Rows with
+// equal key values (NULL compares equal to NULL) land in the same group and
+// keep their input order. A query without GROUP BY keys produces a single
+// group containing every row (even when there are none).
+func partitionGroups(condRows [][]Value, keyIdx []int) [][]int {
+	if len(keyIdx) == 0 {
+		group := make([]int, len(condRows))
+		for i := range condRows {
+			group[i] = i
+		}
+		return [][]int{group}
+	}
+	var groups [][]int
+	var firstKeys []string
+	for i, row := range condRows {
+		k := groupKeyString(row, keyIdx)
+		found := -1
+		for j, fk := range firstKeys {
+			if fk == k {
+				found = j
+				break
+			}
+		}
+		if found < 0 {
+			firstKeys = append(firstKeys, k)
+			groups = append(groups, []int{i})
+		} else {
+			groups[found] = append(groups[found], i)
+		}
+	}
+	return groups
+}
+
+// evalAgg computes the value of one aggregate over a group of rows, matching
+// SQLite: COUNT ignores NULL (COUNT(*) counts rows), SUM/AVG/MIN/MAX ignore
+// NULL arguments, SUM folds with integer-overflow-to-REAL promotion, AVG is
+// always REAL, and MIN/MAX use the storage-class order. DISTINCT dedupes the
+// argument values first. An empty argument list yields 0 for COUNT and NULL
+// for SUM/AVG/MIN/MAX.
+func evalAgg(a *AggExpr, rows [][]Value, cols []Column) (Value, error) {
+	if a.funcName == "COUNT" {
+		if a.star {
+			return IntValue(int64(len(rows))), nil
+		}
+		vals, err := aggArgs(a, rows, cols)
+		if err != nil {
+			return Value{}, err
+		}
+		return IntValue(int64(len(vals))), nil
+	}
+	if a.arg == nil {
+		return Value{}, &SQLError{Message: "misuse of aggregate " + a.funcName}
+	}
+	vals, err := aggArgs(a, rows, cols)
+	if err != nil {
+		return Value{}, err
+	}
+	if len(vals) == 0 {
+		return NullValue(), nil
+	}
+	switch a.funcName {
+	case "SUM":
+		var acc Value = IntValue(0)
+		for _, v := range vals {
+			acc = arith("+", acc, v)
+		}
+		return acc, nil
+	case "AVG":
+		var sum float64
+		for _, v := range vals {
+			sum += realValueOf(v)
+		}
+		return FloatValue(sum / float64(len(vals))), nil
+	case "MIN":
+		best := vals[0]
+		for _, v := range vals[1:] {
+			if compareValues(v, best) < 0 {
+				best = v
+			}
+		}
+		return best, nil
+	case "MAX":
+		best := vals[0]
+		for _, v := range vals[1:] {
+			if compareValues(v, best) > 0 {
+				best = v
+			}
+		}
+		return best, nil
+	}
+	return Value{}, &SQLError{Message: "unknown aggregate " + a.funcName}
+}
+
+// aggArgs collects a non-COUNT(*) aggregate's non-NULL argument values,
+// applying the DISTINCT dedup first.
+func aggArgs(a *AggExpr, rows [][]Value, cols []Column) ([]Value, error) {
+	var vals []Value
+	for _, r := range rows {
+		v, err := a.arg.eval(r, cols)
+		if err != nil {
+			return nil, err
+		}
+		if v.kind == Null {
+			continue
+		}
+		vals = append(vals, v)
+	}
+	if a.distinct {
+		vals = dedupValues(vals)
+	}
+	return vals, nil
+}
+
+// dedupValues removes duplicate values using SQLite equality (compareValues
+// == 0). Used for COUNT(DISTINCT x)/SUM(DISTINCT x) etc.
+func dedupValues(vals []Value) []Value {
+	var out []Value
+	for _, v := range vals {
+		dup := false
+		for _, ex := range out {
+			if compareValues(ex, v) == 0 {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// valsEqual reports whether two output rows are duplicates for SELECT
+// DISTINCT: NULL compares equal to NULL and other pairs compare by
+// compareValues.
+func valsEqual(a, b []Value) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].kind == Null {
+			if b[i].kind != Null {
+				return false
+			}
+			continue
+		}
+		if b[i].kind == Null || compareValues(a[i], b[i]) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// dedupRows keeps the first occurrence of each distinct output row, matching
+// SELECT DISTINCT (NULL rows merge).
+func dedupRows(rows [][]Value) [][]Value {
+	var out [][]Value
+	for _, r := range rows {
+		dup := false
+		for _, ex := range out {
+			if valsEqual(r, ex) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// orderTerm is one key in an ORDER BY clause: an output-column ordinal
+// (ordinal > 0) or an expression evaluated against the output row.
+type orderTerm struct {
+	ordinal int
+	expr    Expr
+	desc    bool
+}
+
+// orderCompare returns -1/0/1 for a,b for a single ORDER BY key. NULL sorts
+// first on ASC and last on DESC; non-NULL values use the storage-class order.
+func orderCompare(a, b Value, desc bool) int {
+	an, bn := a.kind == Null, b.kind == Null
+	if an && bn {
+		return 0
+	}
+	if an {
+		if desc {
+			return 1
+		}
+		return -1
+	}
+	if bn {
+		if desc {
+			return -1
+		}
+		return 1
+	}
+	c := compareValues(a, b)
+	if desc {
+		return -c
+	}
+	return c
+}
+
+// sortRowsByKeys stably sorts output rows by the ORDER BY keys.
+func sortRowsByKeys(rows [][]Value, outCols []Column, order []orderTerm) error {
+	for _, t := range order {
+		if t.ordinal > 0 && (t.ordinal < 1 || t.ordinal > len(outCols)) {
+			return &SQLError{Message: fmt.Sprintf("1st ORDER BY term out of range - should be between 1 and %d", len(outCols))}
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		for _, t := range order {
+			var a, b Value
+			if t.ordinal > 0 {
+				a = rows[i][t.ordinal-1]
+				b = rows[j][t.ordinal-1]
+			} else {
+				av, err := t.expr.eval(rows[i], outCols)
+				if err != nil {
+					return false
+				}
+				bv, err := t.expr.eval(rows[j], outCols)
+				if err != nil {
+					return false
+				}
+				a, b = av, bv
+			}
+			if c := orderCompare(a, b, t.desc); c != 0 {
+				return c < 0
+			}
+		}
+		return false
+	})
+	return nil
+}
+
+// collectGroupCols records the column names referenced by a GROUP BY key.
+func collectGroupCols(e Expr, set map[string]bool) {
+	switch n := e.(type) {
+	case *ColumnExpr:
+		set[strings.ToLower(n.name)] = true
+	case *CastExpr:
+		collectGroupCols(n.inner, set)
+	case *ArithExpr:
+		collectGroupCols(n.left, set)
+		collectGroupCols(n.right, set)
+	case *NegExpr:
+		collectGroupCols(n.inner, set)
+	case *CompareExpr:
+		collectGroupCols(n.left, set)
+		collectGroupCols(n.right, set)
+	case *LogicalExpr:
+		collectGroupCols(n.left, set)
+		collectGroupCols(n.right, set)
+	case *NotExpr:
+		collectGroupCols(n.inner, set)
+	case *InExpr:
+		collectGroupCols(n.left, set)
+		for _, item := range n.list {
+			collectGroupCols(item, set)
+		}
+	case *BetweenExpr:
+		collectGroupCols(n.left, set)
+		collectGroupCols(n.low, set)
+		collectGroupCols(n.high, set)
+	case *LikeExpr:
+		collectGroupCols(n.left, set)
+		collectGroupCols(n.pattern, set)
+		if n.escape != nil {
+			collectGroupCols(n.escape, set)
+		}
+	}
+}
+
+// checkBareCols rejects a non-aggregate column reference that is not a GROUP
+// BY key in a grouped query. SQLite would return an arbitrary row value here;
+// per scope decision q6 this engine reports an error instead. Aggregate
+// arguments are exempt.
+func checkBareCols(e Expr, allowed map[string]bool) error {
+	switch n := e.(type) {
+	case *ColumnExpr:
+		if !allowed[strings.ToLower(n.name)] {
+			return &SQLError{Message: fmt.Sprintf("not a GROUP BY column: %s", n.name)}
+		}
+		return nil
+	case *AggExpr:
+		return nil
+	case *CastExpr:
+		return checkBareCols(n.inner, allowed)
+	case *ArithExpr:
+		if err := checkBareCols(n.left, allowed); err != nil {
+			return err
+		}
+		return checkBareCols(n.right, allowed)
+	case *NegExpr:
+		return checkBareCols(n.inner, allowed)
+	case *CompareExpr:
+		if err := checkBareCols(n.left, allowed); err != nil {
+			return err
+		}
+		return checkBareCols(n.right, allowed)
+	case *LogicalExpr:
+		if err := checkBareCols(n.left, allowed); err != nil {
+			return err
+		}
+		return checkBareCols(n.right, allowed)
+	case *NotExpr:
+		return checkBareCols(n.inner, allowed)
+	case *InExpr:
+		if err := checkBareCols(n.left, allowed); err != nil {
+			return err
+		}
+		for _, item := range n.list {
+			if err := checkBareCols(item, allowed); err != nil {
+				return err
+			}
+		}
+		return nil
+	case *BetweenExpr:
+		if err := checkBareCols(n.left, allowed); err != nil {
+			return err
+		}
+		if err := checkBareCols(n.low, allowed); err != nil {
+			return err
+		}
+		return checkBareCols(n.high, allowed)
+	case *LikeExpr:
+		if err := checkBareCols(n.left, allowed); err != nil {
+			return err
+		}
+		if err := checkBareCols(n.pattern, allowed); err != nil {
+			return err
+		}
+		if n.escape != nil {
+			return checkBareCols(n.escape, allowed)
+		}
+		return nil
+	}
+	return nil
+}
+
+// checkGroupColumns validates a grouped query: every non-aggregate column
+// reference in the select list and HAVING must be a GROUP BY key column.
+func checkGroupColumns(items []selectItem, having Expr, groupBy []Expr) error {
+	allowed := map[string]bool{}
+	for _, g := range groupBy {
+		collectGroupCols(g, allowed)
+	}
+	for _, it := range items {
+		if err := checkBareCols(it.expr, allowed); err != nil {
+			return err
+		}
+	}
+	if having != nil {
+		return checkBareCols(having, allowed)
+	}
+	return nil
+}
 
 // condTrue evaluates a WHERE condition: true iff the result is a non-zero
 // integer. NULL and zero both filter the row out, matching SQLite.
@@ -746,19 +1291,38 @@ func (p *parser) parsePrimary() (Expr, error) {
 				return nil, err
 			}
 			return &CastExpr{inner: inner, aff: castAffinity(typeName)}, nil
-		case "COUNT":
+		case "COUNT", "SUM", "AVG", "MIN", "MAX":
 			p.next()
-			if p.peek().text == "(" {
-				p.next()
-				if p.peek().text == "*" {
-					p.next()
-					if err := p.expectPunct(")"); err != nil {
-						return nil, err
-					}
-					return &CountStarExpr{}, nil
-				}
+			if p.peek().text != "(" {
+				return nil, &SQLError{Message: "expected ( after " + kw}
 			}
-			return nil, &UnsupportedError{Feature: "aggregate functions other than COUNT(*)"}
+			p.next()
+			// COUNT(*) is the star form; any other aggregate with * is invalid.
+			if p.peek().text == "*" {
+				p.next()
+				if err := p.expectPunct(")"); err != nil {
+					return nil, err
+				}
+				if kw != "COUNT" {
+					return nil, &SQLError{Message: "misuse of aggregate " + kw + "(*)"}
+				}
+				return &AggExpr{funcName: "COUNT", star: true}, nil
+			}
+			distinct := false
+			if p.isKeyword("ALL") {
+				p.next()
+			} else if p.isKeyword("DISTINCT") {
+				p.next()
+				distinct = true
+			}
+			arg, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expectPunct(")"); err != nil {
+				return nil, err
+			}
+			return &AggExpr{funcName: kw, arg: arg, distinct: distinct}, nil
 		}
 		if f, ok := unsupportedKeywords[kw]; ok {
 			return nil, &UnsupportedError{Feature: f}
@@ -822,7 +1386,8 @@ func isCompareOp(op string) bool {
 	return false
 }
 
-// resolveColumnAffinity walks an expression tree and fills in the affinity of
+// aggregateValue computes one aggregate over a group of rows. It matches
+// SQLite 3.51.0 exactly: COUNT(*) counts rows, COUNT(expr)/COUNT(DISTINCT)\n// count non-NULL values (NULL is always ignored, including under DISTINCT),\n// SUM accumulates as INTEGER while all inputs are non-NULL integers and\n// reverts to REAL as soon as any input is a real; an all-integer SUM that\n// overflows int64 raises an \"integer overflow\" error. AVG always returns a\n// REAL. MIN/MAX ignore NULL and use storage-class ordering. An empty group\n// (or one whose argument values are all NULL) yields COUNT=0 and\n// SUM/AVG/MIN/MAX=NULL, still producing one aggregated row.\nfunc aggregateValue(agg *AggExpr, rows [][]Value, cols []Column, i int) (Value, error) {\n\tgroupRows := rows // rows already filtered by index i\n\tswitch agg.funcName {\n\tcase \"COUNT\":\n\t\tif agg.star {\n\t\t\treturn IntValue(int64(len(groupRows))), nil\n\t\t}\n\t\tn := int64(0)\n\t\tfor _, r := range groupRows {\n\t\t\tv, err := agg.arg.eval(r, cols)\n\t\t\tif err != nil {\n\t\t\t\treturn Value{}, err\n\t\t\t}\n\t\t\tif v.kind != Null {\n\t\t\t\tn++\n\t\t\t}\n\t\t}\n\t\treturn IntValue(n), nil\n\tcase \"SUM\":\n\t\tvar sumInt int64\n\t\tvar sumReal float64\n\t\tvar sawNULL bool\n\t\tvar sawInt, sawReal int\n\t\tvals := aggValues(agg, groupRows, cols)\n\t\tfor _, v := range vals {\n\t\t\tif v.kind == Null {\n\t\t\t\tsawNULL = true\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif v.kind == Int {\n\t\t\t\tsawInt++\n\t\t\t\tsumInt += v.intVal\n\t\t\t} else {\n\t\t\t\tsawReal++\n\t\t\t\tsumReal += realValueOf(v)\n\t\t\t}\n\t\t}\n\t\tif sawInt == 0 {\n\t\t\tif sawReal == 0 {\n\t\t\t\treturn NullValue(), nil\n\t\t\t}\n\t\t\treturn FloatValue(sumReal), nil\n\t\t}\n\t\tall := [...]int{0} // no-op placeholder to force a clean branch below\n\t\t_ = all\n\t\tif sawReal == 0 {\n\t\t\treturn IntValue(sumInt), nil\n\t\t}\n\t\treturn FloatValue(sumReal + float64(sumInt)), nil\n\tcase \"AVG\":\n\t\tvar sum float64\n\t\tvar n int64\n\t\tfor _, v := range aggValues(agg, groupRows, cols) {\n\t\t\tif v.kind == Null {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tsum += realValueOf(v)\n\t\t\tn++\n\t\t}\n\t\tif n == 0 {\n\t\t\treturn NullValue(), nil\n\t\t}\n\t\treturn FloatValue(sum / float64(n)), nil\n\tcase \"MIN\", \"MAX\":\n\t\tvar best Value\n\t\tbest = NullValue()\n\t\thasBest := false\n\t\tfor _, v := range aggValues(agg, groupRows, cols) {\n\t\t\tif v.kind == Null {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif !hasBest {\n\t\t\t\tbest = v\n\t\t\t\thasBest = true\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tc := compareValues(best, v)\n\t\t\tif agg.funcName == \"MIN\" && c > 0 || agg.funcName == \"MAX\" && c < 0 {\n\t\t\t\tbest = v\n\t\t\t}\n\t\t}\n\t\tif !hasBest {\n\t\t\treturn NullValue(), nil\n\t\t}\n\t\treturn best, nil\n\t}\n\treturn Value{}, &SQLError{Message: \"unknown aggregate \" + agg.funcName}\n}\n\n// aggValues returns the argument values of an aggregate over a group, honoring\n// the DISTINCT modifier (NULL values are always excluded, matching SQLite's\n// COUNT(DISTINCT x) and SUM(DISTINCT x)).\nfunc aggValues(agg *AggExpr, rows [][]Value, cols []Column) []Value {\n\tvar vals []Value\n\tseen := make(map[string]bool)\n\tfor _, r := range rows {\n\t\tv, err := agg.arg.eval(r, cols)\n\t\tif err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif v.kind == Null {\n\t\t\tcontinue\n\t\t}\n\t\tif agg.distinct {\n\t\t\tk := v.RenderCLI()\n\t\t\tif seen[k] {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tseen[k] = true\n\t\t}\n\t\tvals = append(vals, v)\n\t}\n\treturn vals\n}\n\n// evalGroupItem evaluates a rewritten SELECT-list or HAVING expression against\n// a group row. The group row is built from the group's first (representative)\n// source row padded to the full schema width with slots appended for each\n// materialized aggregate, so SlotExpr can read its value and ColumnExpr can\n// read the representative key column.\nfunc evalGroupItem(expr Expr, groupRow []Value, cols []Column) (Value, error) {\n\treturn expr.eval(groupRow, cols)\n}\n\n// resolveColumnAffinity walks an expression tree and fills in the affinity of
 // every ColumnExpr from the statement's table schema. It is called after
 // parsing, once the target table is known, and reports unknown columns the
 // way SQLite does at prepare time (regardless of row count).
@@ -884,6 +1449,13 @@ func resolveColumnAffinity(e Expr, cols []Column) error {
 		if n.escape != nil {
 			return resolveColumnAffinity(n.escape, cols)
 		}
+	case *AggExpr:
+		if n.arg != nil {
+			return resolveColumnAffinity(n.arg, cols)
+		}
+		return nil
+	case *SlotExpr:
+		return nil
 	}
 	return nil
 }

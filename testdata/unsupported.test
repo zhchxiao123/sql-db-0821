@@ -2,6 +2,12 @@
 # an error (never crash) and are reported as waived by the runner (acceptance
 # criterion a6). Run with --strict to count them as failures instead.
 #
+# ORDER BY, LIMIT/OFFSET, DISTINCT, aggregations, GROUP BY and HAVING are now
+# part of the supported subset (implemented in this module) and are tested in
+# orderby.test / limit-offset.test / distinct.test / aggregate.test /
+# groupby.test. HAVING without an aggregate yields a runtime SQLError (matching
+# SQLite "HAVING clause on a non-aggregate query"), recorded here as an error.
+#
 # LIKE/GLOB/BETWEEN/IN/IS/NOT/AND/OR and CAST are part of the expression
 # subset and are deliberately absent here; see expr.test for them.
 
@@ -11,30 +17,8 @@ CREATE TABLE t (a INTEGER, b TEXT)
 statement ok
 INSERT INTO t VALUES (1, 'x')
 
-query I rowsort
-SELECT a FROM t ORDER BY a
-----
-1
-
-query I rowsort
-SELECT a FROM t LIMIT 1
-----
-1
-
-query I rowsort
-SELECT DISTINCT a FROM t
-----
-1
-
-query I rowsort
-SELECT a FROM t GROUP BY a
-----
-1
-
-query I rowsort
+statement error
 SELECT a FROM t HAVING a > 0
-----
-1
 
 query I rowsort
 SELECT a FROM t UNION SELECT a FROM t

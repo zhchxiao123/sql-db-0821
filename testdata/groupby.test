@@ -1,0 +1,73 @@
+# groupby.test — GROUP BY (single/multi-column) and HAVING, with NULL group
+# keys coalescing into one group (matching SQLite). All expected values were
+# verified against sqlite3 3.51.0; NULL group keys render as "NULL".
+
+statement ok
+CREATE TABLE n (a INTEGER, b INTEGER, c INTEGER)
+
+statement ok
+INSERT INTO n VALUES (1,5,30)
+
+statement ok
+INSERT INTO n VALUES (2,10,50)
+
+statement ok
+INSERT INTO n VALUES (1,20,30)
+
+statement ok
+INSERT INTO n VALUES (NULL,40,NULL)
+
+# Single-column grouping with aggregates.
+query ITI rowsort
+SELECT a, sum(b), sum(c) FROM n GROUP BY a
+----
+1
+25
+60
+2
+10
+50
+NULL
+40
+NULL
+
+query III rowsort
+SELECT a, count(*), count(a) FROM n GROUP BY a
+----
+1
+2
+2
+2
+1
+1
+NULL
+1
+0
+
+# HAVING can reference aggregates that are not projected.
+query III rowsort
+SELECT a, count(*), sum(b) FROM n GROUP BY a HAVING count(*) > 1
+----
+1
+2
+25
+
+query III rowsort
+SELECT a, count(*), sum(b) FROM n GROUP BY a HAVING sum(b) >= 20
+----
+1
+2
+25
+NULL
+1
+40
+
+# Empty GROUP BY (globally aggregated single group).
+query II
+SELECT count(*), sum(b) FROM n
+----
+4
+75
+
+statement ok
+DROP TABLE n

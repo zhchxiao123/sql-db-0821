@@ -30,10 +30,23 @@ Makefile           build / test / suite / check targets
 - `INSERT INTO t [(cols)] VALUES (...)` — one row per statement. Values are
   converted to the target column's affinity (INTEGER/REAL/TEXT/NUMERIC/BLOB),
   matching SQLite's storage rules.
-- `SELECT [ALL|DISTINCT] expr [AS alias] [, ...] [FROM t [WHERE expr]]` —
-  constant SELECTs (no `FROM`) evaluate once; `DISTINCT` is a no-op for a
-  constant SELECT and unsupported with `FROM`; `COUNT(*)` counts rows with
-  `FROM` and evaluates to 1 without it.
+- `SELECT [ALL|DISTINCT] expr [AS alias] [, ...] [FROM t [WHERE expr]]`
+  — constant SELECTs (no `FROM`) evaluate once; `DISTINCT` dedups whole rows
+  (NULL equal to NULL, matching SQLite); `COUNT(*)` counts rows with `FROM`
+  and evaluates to 1 without it.
+- `ORDER BY key [ASC|DESC] [, ...]` — sort keys may be a result-column ordinal
+  (`ORDER BY 1`), a column name, or an expression; NULLs sort first on ASC and
+  last on DESC (matching SQLite).
+- `LIMIT n [OFFSET m]` and the SQLite comma form `LIMIT m,n` — with the same
+  edge semantics as SQLite (LIMIT 0 → no rows, over-limit OFFSET → no rows,
+  negative LIMIT → unlimited; an `OFFSET` without a `LIMIT` is an error).
+- Aggregate functions `count(*)`, `count(expr)`, `sum`, `avg`, `min`, `max`
+  with optional `ALL`/`DISTINCT` — NULL arguments are ignored, empty argument
+  sets yield `count=0` and `sum/avg/min/max=NULL`, and the whole SELECT still
+  returns exactly one row.
+- `GROUP BY expr [, ...]` (NULL group keys coalesce into one group) and
+  `HAVING expr` (may reference aggregate results, not just projected ones);
+  a `HAVING` without an aggregate is an error, matching SQLite.
 - `UPDATE t SET col = expr [, ...] [WHERE expr]`
 - `DELETE FROM t [WHERE expr]`
 - `DROP TABLE t`
@@ -55,9 +68,9 @@ Expressions follow SQLite semantics, verified against sqlite3 3.51.0:
   NULL yields NULL (except `IS`/`IS NOT` and the logical short-circuits).
 - **Blob literals** `X'hex'` and the `==` operator (alias for `=`).
 
-Everything else — `ORDER BY`, `LIMIT`, `DISTINCT` (with `FROM`), `GROUP BY`,
-`JOIN`, `UNION`, `CASE`, subqueries, function calls, aggregates other than
-bare `COUNT(*)`, transactions, `CREATE INDEX`/`VIEW`, `ALTER`, `PRAGMA` — is
+Everything else — `JOIN`, `UNION`, `EXISTS` subqueries, `CASE`,
+non-aggregate function calls (`abs`, `coalesce`, …), `SELECT * FROM t1, t2`
+cross joins, transactions, `CREATE INDEX`/`VIEW`, `ALTER`, `PRAGMA` — is
 rejected with an `UnsupportedError` (never a crash). The runner reports such
 records as **waived** rather than failed; see the waiver policy below.
 

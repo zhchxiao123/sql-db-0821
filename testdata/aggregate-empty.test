@@ -1,0 +1,56 @@
+# aggregate-empty.test — aggregate semantics over the empty set.
+# SQLite returns exactly one row: COUNT(*)=0, COUNT(col)=0, and
+# SUM/AVG/MIN/MAX = NULL over an empty argument set.
+# Every expected value below was verified against sqlite3 3.51.0.
+
+statement ok
+CREATE TABLE e (a INTEGER)
+
+query I
+SELECT count(*) FROM e
+----
+0
+
+query I
+SELECT count(a) FROM e
+----
+0
+
+query R
+SELECT sum(a) FROM e
+----
+NULL
+
+query R
+SELECT avg(a) FROM e
+----
+NULL
+
+query R
+SELECT min(a) FROM e
+----
+NULL
+
+query R
+SELECT max(a) FROM e
+----
+NULL
+
+# Empty-set aggregates all in one SELECT.
+query IRRRR
+SELECT count(*), sum(a), avg(a), min(a), max(a) FROM e
+----
+0
+NULL
+NULL
+NULL
+NULL
+
+# Arithmetic over an empty-set aggregate still yields 1 row.
+query I
+SELECT count(*) + 1 FROM e
+----
+1
+
+statement ok
+DROP TABLE e

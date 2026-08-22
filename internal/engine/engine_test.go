@@ -174,11 +174,6 @@ func TestUnsupportedConstructs(t *testing.T) {
 	exec(t, e, "CREATE TABLE t (a INTEGER, b TEXT)")
 	exec(t, e, "INSERT INTO t VALUES (1, 'x')")
 	cases := []string{
-		"SELECT * FROM t ORDER BY a",
-		"SELECT * FROM t LIMIT 1",
-		"SELECT DISTINCT a FROM t",
-		"SELECT a FROM t GROUP BY a",
-		"SELECT a FROM t HAVING a > 0",
 		"SELECT * FROM t JOIN t2 ON t.a = t2.a",
 		"SELECT a FROM t UNION SELECT a FROM t",
 		"SELECT CASE WHEN a > 0 THEN 1 ELSE 0 END FROM t",
@@ -186,8 +181,6 @@ func TestUnsupportedConstructs(t *testing.T) {
 		"SELECT coalesce(a, b) FROM t",
 		"SELECT (SELECT a FROM t) FROM t",
 		"SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t)",
-		"SELECT count(a) FROM t",
-		"SELECT min(a) FROM t",
 		"CREATE INDEX idx ON t (a)",
 		"CREATE VIEW v AS SELECT * FROM t",
 		"ALTER TABLE t ADD COLUMN c INTEGER",

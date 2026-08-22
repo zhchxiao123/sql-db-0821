@@ -1,0 +1,113 @@
+# orderby.test — ORDER BY across one and several keys, ASC/DESC, NULL
+# placement (NULLs first on ASC, last on DESC — matching SQLite), result-column
+# ordinals and expression keys.
+# Every expected value below was verified against sqlite3 3.51.0.
+
+statement ok
+CREATE TABLE t (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (3, 'three')
+
+statement ok
+INSERT INTO t VALUES (1, 'one')
+
+statement ok
+INSERT INTO t VALUES (2, 'two')
+
+statement ok
+INSERT INTO t VALUES (NULL, 'null')
+
+# NULLs sort first on ASC, last on DESC.
+query I
+SELECT a FROM t ORDER BY a
+----
+NULL
+1
+2
+3
+
+query I
+SELECT a FROM t ORDER BY a ASC
+----
+NULL
+1
+2
+3
+
+query I
+SELECT a FROM t ORDER BY a DESC
+----
+3
+2
+1
+NULL
+
+# Ordinal sort key: ORDER BY 1 sorts by the first result column.
+query IT
+SELECT a, b FROM t ORDER BY 1
+----
+NULL
+null
+1
+one
+2
+two
+3
+three
+
+# Multi-key ORDER BY.
+query IT
+SELECT a, b FROM t ORDER BY a DESC, b ASC
+----
+3
+three
+2
+two
+1
+one
+NULL
+null
+
+# Expression sort keys.
+statement ok
+CREATE TABLE s (a INTEGER)
+
+statement ok
+INSERT INTO s VALUES (3)
+
+statement ok
+INSERT INTO s VALUES (1)
+
+statement ok
+INSERT INTO s VALUES (2)
+
+statement ok
+INSERT INTO s VALUES (NULL)
+
+statement ok
+INSERT INTO s VALUES (1)
+
+query I
+SELECT a FROM s ORDER BY -a
+----
+NULL
+3
+2
+1
+1
+
+query I
+SELECT a FROM s ORDER BY a + 1
+----
+NULL
+1
+1
+2
+3
+
+statement ok
+DROP TABLE t
+
+statement ok
+DROP TABLE s
