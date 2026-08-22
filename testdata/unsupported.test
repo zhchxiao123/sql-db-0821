@@ -1,6 +1,9 @@
-# unsupported.test — constructs outside the minimal SQL subset must return an
-# error (never crash) and are reported as waived by the runner (acceptance
+# unsupported.test — constructs outside the supported SQL subset must return
+# an error (never crash) and are reported as waived by the runner (acceptance
 # criterion a6). Run with --strict to count them as failures instead.
+#
+# LIKE/GLOB/BETWEEN/IN/IS/NOT/AND/OR and CAST are part of the expression
+# subset and are deliberately absent here; see expr.test for them.
 
 statement ok
 CREATE TABLE t (a INTEGER, b TEXT)
@@ -40,31 +43,6 @@ SELECT a FROM t UNION SELECT a FROM t
 
 query I rowsort
 SELECT CASE WHEN a > 0 THEN 1 ELSE 0 END FROM t
-----
-1
-
-query I rowsort
-SELECT * FROM t WHERE a LIKE '1%'
-----
-1
-
-query I rowsort
-SELECT * FROM t WHERE a BETWEEN 1 AND 2
-----
-1
-
-query I rowsort
-SELECT * FROM t WHERE a IN (1, 2)
-----
-1
-
-query I rowsort
-SELECT * FROM t WHERE a IS NULL
-----
-1
-
-query I rowsort
-SELECT * FROM t WHERE a = 1 AND b = 'x'
 ----
 1
 
