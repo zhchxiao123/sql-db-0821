@@ -50,6 +50,15 @@ Makefile           build / test / suite / check targets
 - `UPDATE t SET col = expr [, ...] [WHERE expr]`
 - `DELETE FROM t [WHERE expr]`
 - `DROP TABLE t`
+- `BEGIN` / `COMMIT` / `ROLLBACK` — explicit transactions; every standalone
+  statement (INSERT/UPDATE/DELETE/DDL outside a transaction) runs under an
+  implicit autocommit transaction, so a statement that fails mid-way leaves no
+  partial change (statement-level atomicity, copy-on-write rows).
+- Two or more concurrent connections share one store: reads take a snapshot of
+  the committed tables (uncommitted writes of another connection are invisible,
+  matching SQLite's default isolation), and writes are mutually exclusive — a
+  second writer gets `database is locked` immediately (SQLite without
+  busy_timeout), not a block.
 
 Expressions follow SQLite semantics, verified against sqlite3 3.51.0:
 
@@ -129,6 +138,21 @@ make check
 
 ### Engine CLI
 
+Durability: with `-db <file>` the committed state is serialized to a JSON file
+on every commit (temp file + fsync + atomic rename + directory fsync), so a
+committed transaction survives a `kill -9` while an uncommitted one does not;
+the file is loaded again on the next run. Without `-db` the store is purely
+in-memory.
+
+```sh
+go run ./cmd/sqldb -db /tmp/db.json <<'EOF'
+CREATE TABLE t (a INTEGER);
+BEGIN;
+INSERT INTO t VALUES (1);
+COMMIT;   -- durable
+EOF
+```
+
 ```sh
 go run ./cmd/sqldb <<'EOF'
 CREATE TABLE t (a INTEGER, b TEXT);
@@ -163,6 +187,8 @@ go run ./cmd/sqllogictest --strict
   CAST, overflow promotion, full-expression UPDATE/DELETE WHERE, column
   affinity. Every expected value verified against sqlite3 3.51.0. Passes.
 - `unsupported.test` — unsupported constructs return errors (waived). Passes.
+- `transaction.test` — BEGIN/COMMIT/ROLLBACK, implicit autocommit,
+  statement-level atomicity after a failed statement. Passes.
 - `wrong.test` — deliberately wrong expected values; running it must report
   failures (exit code 1). Used to verify failure detection.
 

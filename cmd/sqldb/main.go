@@ -1,14 +1,19 @@
 // Command sqldb is the command-line entry point of the minimal SQL engine.
 // It reads a sequence of SQL statements from stdin (separated by ';'),
-// executes them in a fresh in-memory database, and prints SELECT results in
-// the sqlite3 CLI format: one row per line, values joined with '|', NULL
-// rendered as the literal "NULL". Non-SELECT statements print nothing.
+// executes them, and prints SELECT results in the sqlite3 CLI format: one row
+// per line, values joined with '|', NULL rendered as the literal "NULL".
+// Non-SELECT statements print nothing.
+//
+// With -db <file> the database persists durably on every COMMIT and is loaded
+// again on the next run (crash recovery); without it the database is in-memory
+// and lost when the process exits.
 //
 // Exit code is 0 on success and 1 on the first error, which is reported on
 // stderr.
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -18,12 +23,23 @@ import (
 )
 
 func main() {
+	dbPath := flag.String("db", "", "persistent database file ('' = in-memory)")
+	flag.Parse()
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error reading stdin: %v\n", err)
 		os.Exit(1)
 	}
-	eng := engine.New()
+	var eng *engine.Engine
+	if *dbPath != "" {
+		eng, err = engine.Open(*dbPath)
+	} else {
+		eng = engine.New()
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+		os.Exit(1)
+	}
 	for _, stmt := range splitStatements(string(data)) {
 		if strings.TrimSpace(stmt) == "" {
 			continue

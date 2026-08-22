@@ -32,34 +32,30 @@ type token struct {
 // does not allow. LIKE/GLOB/BETWEEN/IN/IS/NOT/AND/OR are deliberately absent:
 // they are part of the expression subset.
 var unsupportedKeywords = map[string]string{
-	"JOIN":     "JOIN",
-	"INNER":    "JOIN",
-	"LEFT":     "JOIN",
-	"RIGHT":    "JOIN",
-	"FULL":     "JOIN",
-	"CROSS":    "JOIN",
-	"UNION":    "UNION",
+	"JOIN":      "JOIN",
+	"INNER":     "JOIN",
+	"LEFT":      "JOIN",
+	"RIGHT":     "JOIN",
+	"FULL":      "JOIN",
+	"CROSS":     "JOIN",
+	"UNION":     "UNION",
 	"INTERSECT": "UNION",
-	"EXCEPT":   "UNION",
-	"CASE":     "CASE expression",
-	"WHEN":     "CASE expression",
-	"THEN":     "CASE expression",
-	"ELSE":     "CASE expression",
-	"END":      "CASE expression",
-	"EXISTS":   "EXISTS subquery",
-	"INDEX":    "CREATE INDEX",
-	"ALTER":       "ALTER TABLE",
-	"VIEW":        "VIEW",
-	"TRANSACTION": "transaction",
-	"BEGIN":       "transaction",
-	"COMMIT":      "transaction",
-	"ROLLBACK":    "transaction",
-	"PRAGMA":      "PRAGMA",
-	"VACUUM":      "VACUUM",
-	"ATTACH":      "ATTACH",
-	"DETACH":      "DETACH",
-	"REINDEX":     "REINDEX",
-	"ANALYZE":     "ANALYZE",
+	"EXCEPT":    "UNION",
+	"CASE":      "CASE expression",
+	"WHEN":      "CASE expression",
+	"THEN":      "CASE expression",
+	"ELSE":      "CASE expression",
+	"END":       "CASE expression",
+	"EXISTS":    "EXISTS subquery",
+	"INDEX":     "CREATE INDEX",
+	"ALTER":     "ALTER TABLE",
+	"VIEW":      "VIEW",
+	"PRAGMA":    "PRAGMA",
+	"VACUUM":    "VACUUM",
+	"ATTACH":    "ATTACH",
+	"DETACH":    "DETACH",
+	"REINDEX":   "REINDEX",
+	"ANALYZE":   "ANALYZE",
 }
 
 // selectStopKeywords are keywords that terminate a SELECT list, so an
@@ -85,7 +81,7 @@ func isIdentPart(c byte) bool {
 }
 
 // tokenize splits SQL text into tokens. String literals use single quotes
-// with '' as the escaped quote, blob literals use X'hex', and == is accepted
+// with ” as the escaped quote, blob literals use X'hex', and == is accepted
 // as an alias for =, all matching SQLite.
 func tokenize(sql string) ([]token, error) {
 	var toks []token
@@ -312,7 +308,7 @@ func (p *parser) skipColumnConstraints() error {
 }
 
 // parseCreate handles CREATE TABLE (and rejects CREATE INDEX / VIEW).
-func (e *Engine) parseCreate(p *parser) (*Result, error) {
+func parseCreate(p *parser, tbls map[string]*Table) (*Result, error) {
 	p.next() // CREATE
 	kw := strings.ToUpper(p.peek().text)
 	switch kw {
@@ -369,16 +365,16 @@ func (e *Engine) parseCreate(p *parser) (*Result, error) {
 	if err := p.checkTrailing(); err != nil {
 		return nil, err
 	}
-	if _, exists := e.tables[name]; exists {
+	if _, exists := tbls[name]; exists {
 		return nil, &SQLError{Message: fmt.Sprintf("table %q already exists", name)}
 	}
-	e.tables[name] = &Table{Name: name, Columns: cols}
+	tbls[name] = &Table{Name: name, Columns: cols}
 	return &Result{}, nil
 }
 
 // parseInsert handles INSERT INTO t [(cols)] VALUES (...). Values are
 // converted to the target column's affinity, matching SQLite's storage rules.
-func (e *Engine) parseInsert(p *parser) (*Result, error) {
+func parseInsert(p *parser, tbls map[string]*Table) (*Result, error) {
 	p.next() // INSERT
 	if !strings.EqualFold(p.peek().text, "INTO") {
 		return nil, &SQLError{Message: "expected INTO after INSERT"}
@@ -433,7 +429,7 @@ func (e *Engine) parseInsert(p *parser) (*Result, error) {
 	if err := p.checkTrailing(); err != nil {
 		return nil, err
 	}
-	tbl, ok := e.tables[name]
+	tbl, ok := tbls[name]
 	if !ok {
 		return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
 	}
@@ -533,7 +529,7 @@ func containsCountStar(e Expr) bool {
 // placement), LIMIT/OFFSET and DISTINCT. An aggregate query (one with GROUP BY
 // or an aggregate in the select list or HAVING) computes one output row per
 // group; a without-FROM SELECT supplies a single constant row so COUNT(*)=1.
-func (e *Engine) parseSelect(p *parser) (*Result, error) {
+func parseSelect(p *parser, tbls map[string]*Table) (*Result, error) {
 	p.next() // SELECT
 	distinct := false
 	if p.isKeyword("ALL") {
@@ -602,7 +598,7 @@ func (e *Engine) parseSelect(p *parser) (*Result, error) {
 			}
 		}
 		var ok bool
-		tbl, ok = e.tables[name]
+		tbl, ok = tbls[name]
 		if !ok {
 			return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
 		}
@@ -909,7 +905,7 @@ func (e *Engine) parseSelect(p *parser) (*Result, error) {
 }
 
 // parseUpdate handles UPDATE t SET col = expr [, ...] [WHERE expr].
-func (e *Engine) parseUpdate(p *parser) (*Result, error) {
+func parseUpdate(p *parser, tbls map[string]*Table) (*Result, error) {
 	p.next() // UPDATE
 	name, err := p.expectIdent()
 	if err != nil {
@@ -955,7 +951,7 @@ func (e *Engine) parseUpdate(p *parser) (*Result, error) {
 	if err := p.checkTrailing(); err != nil {
 		return nil, err
 	}
-	tbl, ok := e.tables[name]
+	tbl, ok := tbls[name]
 	if !ok {
 		return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
 	}
@@ -975,25 +971,33 @@ func (e *Engine) parseUpdate(p *parser) (*Result, error) {
 			return nil, err
 		}
 	}
+	// Copy-on-write: every updated row is built on a private copy and swapped
+	// in only when the whole statement succeeds, so a failed evaluation can't
+	// leave a partially-mutated row behind (statement-level atomicity).
+	var updated [][]Value
 	var affected int64
 	for _, row := range tbl.Rows {
 		if cond != nil && !condTrue(cond, row, tbl.Columns) {
+			updated = append(updated, row)
 			continue
 		}
+		cp := append([]Value(nil), row...)
 		for i, a := range assigns {
-			v, err := a.val.eval(row, tbl.Columns)
+			v, err := a.val.eval(cp, tbl.Columns)
 			if err != nil {
 				return nil, err
 			}
-			row[idxs[i]] = v
+			cp[idxs[i]] = v
 		}
+		updated = append(updated, cp)
 		affected++
 	}
+	tbl.Rows = updated
 	return &Result{Affected: affected}, nil
 }
 
 // parseDelete handles DELETE FROM t [WHERE expr].
-func (e *Engine) parseDelete(p *parser) (*Result, error) {
+func parseDelete(p *parser, tbls map[string]*Table) (*Result, error) {
 	p.next() // DELETE
 	if !strings.EqualFold(p.peek().text, "FROM") {
 		return nil, &SQLError{Message: "expected FROM after DELETE"}
@@ -1014,7 +1018,7 @@ func (e *Engine) parseDelete(p *parser) (*Result, error) {
 	if err := p.checkTrailing(); err != nil {
 		return nil, err
 	}
-	tbl, ok := e.tables[name]
+	tbl, ok := tbls[name]
 	if !ok {
 		return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
 	}
@@ -1035,7 +1039,7 @@ func (e *Engine) parseDelete(p *parser) (*Result, error) {
 }
 
 // parseDrop handles DROP TABLE t (and rejects DROP INDEX / VIEW).
-func (e *Engine) parseDrop(p *parser) (*Result, error) {
+func parseDrop(p *parser, tbls map[string]*Table) (*Result, error) {
 	p.next() // DROP
 	kw := strings.ToUpper(p.peek().text)
 	switch kw {
@@ -1055,9 +1059,9 @@ func (e *Engine) parseDrop(p *parser) (*Result, error) {
 	if err := p.checkTrailing(); err != nil {
 		return nil, err
 	}
-	if _, ok := e.tables[name]; !ok {
+	if _, ok := tbls[name]; !ok {
 		return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
 	}
-	delete(e.tables, name)
+	delete(tbls, name)
 	return &Result{}, nil
 }
