@@ -2,7 +2,9 @@ package engine
 
 import (
 	"errors"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -186,8 +188,6 @@ func TestUnsupportedConstructs(t *testing.T) {
 		"ALTER TABLE t ADD COLUMN c INTEGER",
 		"DROP INDEX idx",
 		"DROP VIEW v",
-		"BEGIN",
-		"COMMIT",
 		"PRAGMA table_info(t)",
 	}
 	for _, sql := range cases {
@@ -466,4 +466,186 @@ func TestBlobLiterals(t *testing.T) {
 	}
 	execErr(t, e, "INSERT INTO t VALUES (X'4')")  // odd hex length
 	execErr(t, e, "INSERT INTO t VALUES (X'zz')") // non-hex
+}
+
+// connExec runs a statement on a specific connection and fails on error.
+func connExec(t *testing.T, c *Conn, sql string) *Result {
+	t.Helper()
+	res, err := c.Execute(sql)
+	if err != nil {
+		t.Fatalf("conn Execute(%q) error: %v", sql, err)
+	}
+	return res
+}
+
+// connCount runs "SELECT count(*) FROM t" on a connection and returns the int.
+func connCount(t *testing.T, c *Conn) int {
+	t.Helper()
+	res := connExec(t, c, "SELECT count(*) FROM t")
+	if len(res.Rows) != 1 || len(res.Rows[0]) != 1 {
+		t.Fatalf("count rows = %v, want one scalar", res.Rows)
+	}
+	return int(intValueOf(res.Rows[0][0]))
+}
+
+func TestBeginCommitRollback(t *testing.T) {
+	e := New()
+	exec(t, e, "CREATE TABLE t (a INTEGER)")
+	// ROLLBACK discards the uncommitted insert (acceptance a2).
+	exec(t, e, "BEGIN")
+	exec(t, e, "INSERT INTO t VALUES (1)")
+	exec(t, e, "ROLLBACK")
+	res := exec(t, e, "SELECT count(*) FROM t")
+	if got := rowsText(res); len(got) != 1 || got[0] != "0" {
+		t.Errorf("after rollback: got %v want [0]", got)
+	}
+	// COMMIT keeps the insert (acceptance a2).
+	exec(t, e, "BEGIN")
+	exec(t, e, "INSERT INTO t VALUES (1)")
+	exec(t, e, "COMMIT")
+	res = exec(t, e, "SELECT count(*) FROM t")
+	if got := rowsText(res); len(got) != 1 || got[0] != "1" {
+		t.Errorf("after commit: got %v want [1]", got)
+	}
+}
+
+func TestCommitWithoutTransactionErrors(t *testing.T) {
+	e := New()
+	exec(t, e, "CREATE TABLE t (a INTEGER)")
+	execErr(t, e, "COMMIT")
+	// ROLLBACK with no active transaction is a no-op (SQLite).
+	exec(t, e, "ROLLBACK")
+	// BEGIN inside a transaction is an error.
+	exec(t, e, "BEGIN")
+	execErr(t, e, "BEGIN")
+	exec(t, e, "COMMIT")
+}
+
+func TestCompoundRollback(t *testing.T) {
+	e := New()
+	exec(t, e, "CREATE TABLE t (a INTEGER)")
+	exec(t, e, "BEGIN")
+	exec(t, e, "INSERT INTO t VALUES (1)")
+	exec(t, e, "INSERT INTO t VALUES (2)")
+	exec(t, e, "ROLLBACK")
+	// Both inserts roll back together; no partial commit.
+	res := exec(t, e, "SELECT count(*) FROM t")
+	if got := rowsText(res); len(got) != 1 || got[0] != "0" {
+		t.Errorf("compound rollback: got %v want [0]", got)
+	}
+}
+
+func TestImplicitAutocommit(t *testing.T) {
+	e := New()
+	exec(t, e, "CREATE TABLE t (a INTEGER)")
+	exec(t, e, "INSERT INTO t VALUES (1)")
+	exec(t, e, "INSERT INTO t VALUES (2)")
+	// Each standalone statement commits immediately (autocommit).
+	res := exec(t, e, "SELECT count(*) FROM t")
+	if got := rowsText(res); len(got) != 1 || got[0] != "2" {
+		t.Errorf("autocommit: got %v want [2]", got)
+	}
+}
+
+func TestStatementLevelAtomicity(t *testing.T) {
+	e := New()
+	exec(t, e, "CREATE TABLE t (a INTEGER, b INTEGER)")
+	exec(t, e, "INSERT INTO t VALUES (1, 2)")
+	// UPDATE with a failing assignment in the middle must leave the table
+	// unchanged: the earlier assignment (a=9) must not survive. The second
+	// assignment errors at eval time (multi-char ESCAPE), so copy-on-write
+	// discards the partially-built row copy. Check b is a TEXT column so the
+	// LIKE is well-typed.
+	exec(t, e, "CREATE TABLE s (a INTEGER, b TEXT)")
+	exec(t, e, "INSERT INTO s VALUES (1, 'x')")
+	execErr(t, e, "UPDATE s SET a = 9, b = b LIKE 'x%' ESCAPE 'ee'")
+	res := exec(t, e, "SELECT * FROM s")
+	if got := rowsText(res); len(got) != 1 || got[0] != "1|x" {
+		t.Errorf("partial update leaked: got %v want [1|x]", got)
+	}
+}
+
+func TestPersistCrashRecovery(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db.json")
+	// First session: a committed write plus an uncommitted write.
+	e1, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(t, e1, "CREATE TABLE t (a INTEGER)")
+	exec(t, e1, "BEGIN")
+	exec(t, e1, "INSERT INTO t VALUES (1)")
+	exec(t, e1, "COMMIT")                   // durable
+	exec(t, e1, "INSERT INTO t VALUES (2)") // autocommit, durable
+	exec(t, e1, "BEGIN")
+	exec(t, e1, "INSERT INTO t VALUES (3)")
+	exec(t, e1, "ROLLBACK")
+	// Second session simulates restart (acceptance a3): only committed rows
+	// survive.
+	e2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := exec(t, e2, "SELECT count(*) FROM t")
+	if got := rowsText(res); len(got) != 1 || got[0] != "2" {
+		t.Errorf("after restart: got %v want [2]", got)
+	}
+}
+
+func TestConcurrencyReadIsolation(t *testing.T) {
+	e := New()
+	exec(t, e, "CREATE TABLE t (a INTEGER)")
+	exec(t, e, "INSERT INTO t VALUES (0)")
+	connA := e.Connect()
+	connB := e.Connect()
+	// A's uncommitted insert is invisible to B (acceptance a4).
+	connExec(t, connA, "BEGIN")
+	connExec(t, connA, "INSERT INTO t VALUES (1)")
+	if got := connCount(t, connB); got != 1 {
+		t.Errorf("B sees %d rows before A commits, want 1", got)
+	}
+	connExec(t, connA, "COMMIT")
+	if got := connCount(t, connB); got != 2 {
+		t.Errorf("B sees %d rows after A commits, want 2", got)
+	}
+}
+
+func TestConcurrencyWriteLock(t *testing.T) {
+	e := New()
+	exec(t, e, "CREATE TABLE t (a INTEGER)")
+	connA := e.Connect()
+	connB := e.Connect()
+	// Two connections cannot write concurrently; the second is locked.
+	connExec(t, connA, "BEGIN")
+	connExec(t, connA, "INSERT INTO t VALUES (1)")
+	if _, err := connB.Execute("INSERT INTO t VALUES (2)"); err == nil {
+		t.Error("B's write succeeded while A held the lock, want 'database is locked'")
+	}
+	connExec(t, connA, "COMMIT")
+	// After A commits, B can write again.
+	connExec(t, connB, "INSERT INTO t VALUES (2)")
+	if got := connCount(t, connB); got != 2 {
+		t.Errorf("after B: got %d rows, want 2", got)
+	}
+}
+
+func TestConcurrentReadersNoDataRace(t *testing.T) {
+	e := New()
+	exec(t, e, "CREATE TABLE t (a INTEGER)")
+	for i := 1; i <= 50; i++ {
+		exec(t, e, "INSERT INTO t VALUES (1)")
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c := e.Connect()
+			for j := 0; j < 100; j++ {
+				connExec(t, c, "SELECT a FROM t")
+			}
+		}()
+	}
+	wg.Wait()
 }

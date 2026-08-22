@@ -1,0 +1,64 @@
+# transaction.test — BEGIN/COMMIT/ROLLBACK, statement-level atomicity and
+# implicit autocommit (acceptance criteria a1/a2). Uncommitted changes are
+# discarded by ROLLBACK; committed changes are kept by COMMIT; every standalone
+# statement auto-commits. Durability (crash recovery, a3) is covered by the
+# engine's TestPersistCrashRecovery via -db.
+
+statement ok
+CREATE TABLE t (a INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+# COMMIT makes a transaction's changes stick.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (2)
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM t
+----
+2
+
+# ROLLBACK discards everything since BEGIN.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (3)
+
+statement ok
+INSERT INTO t VALUES (4)
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM t
+----
+2
+
+# A standalone INSERT commits immediately (autocommit).
+statement ok
+INSERT INTO t VALUES (5)
+
+query I
+SELECT count(*) FROM t
+----
+3
+
+# A failed statement leaves no partial change: the first assignment (a = 99)
+# is applied to a private row copy, then the second errors at eval time
+# (multi-character ESCAPE), so nothing is committed.
+statement error
+UPDATE t SET a = 99, a = a LIKE 'x%' ESCAPE 'ee'
+
+query I
+SELECT count(*) FROM t
+----
+3

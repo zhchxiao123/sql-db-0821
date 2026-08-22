@@ -55,7 +55,4 @@ statement error
 ALTER TABLE t ADD COLUMN c INTEGER
 
 statement error
-BEGIN
-
-statement error
 PRAGMA table_info(t)
