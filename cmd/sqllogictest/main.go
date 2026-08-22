@@ -1,7 +1,7 @@
 // Command sqllogictest runs .test files against the minimal SQL engine and
 // reports pass/fail statistics. With no file arguments it runs every
-// suite/select*.test file. Each file runs against a fresh engine, matching
-// the reference sqllogictest runner.
+// suite/select*.test and suite/random/expr/*.test file. Each file runs
+// against a fresh engine, matching the reference sqllogictest runner.
 //
 // Records that use constructs outside the minimal SQL subset are reported
 // as waived (see README); with --strict they count as failures instead.
@@ -23,10 +23,14 @@ func main() {
 	flag.Parse()
 	files := flag.Args()
 	if len(files) == 0 {
-		matches, err := filepath.Glob("suite/select*.test")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(2)
+		var matches []string
+		for _, pat := range []string{"suite/select*.test", "suite/random/expr/*.test"} {
+			m, err := filepath.Glob(pat)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(2)
+			}
+			matches = append(matches, m...)
 		}
 		files = matches
 	}
