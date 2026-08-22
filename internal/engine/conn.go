@@ -16,9 +16,10 @@ import (
 // "database is locked" instead of blocking, matching SQLite without
 // busy_timeout.
 type Engine struct {
-	lock   sync.Mutex
-	tables map[string]*Table // committed state
-	dbPath string            // persistent database file; "" = in-memory
+	lock    sync.Mutex
+	tables  map[string]*Table // committed state
+	indexes map[string]*Index // committed index catalog (keyed by index name)
+	dbPath  string            // persistent database file; "" = in-memory
 
 	writerL sync.Mutex
 	writer  *Conn // connection holding the write lock, nil if none
@@ -28,7 +29,7 @@ type Engine struct {
 
 // New returns an empty in-memory shared store.
 func New() *Engine {
-	return &Engine{tables: make(map[string]*Table)}
+	return &Engine{tables: make(map[string]*Table), indexes: make(map[string]*Index)}
 }
 
 // Open loads a database previously persisted at path (crash recovery on
@@ -36,12 +37,13 @@ func New() *Engine {
 func Open(path string) (*Engine, error) {
 	e := New()
 	e.dbPath = path
-	loaded, err := loadTables(path)
+	loaded, loadedIdx, err := loadTables(path)
 	if err != nil {
 		return nil, err
 	}
 	e.lock.Lock()
 	e.tables = loaded
+	e.indexes = loadedIdx
 	e.lock.Unlock()
 	return e, nil
 }
@@ -62,30 +64,41 @@ func (e *Engine) Execute(sql string) (*Result, error) {
 	return e.defaultConn.Execute(sql)
 }
 
-// snapshot returns a view of the committed tables. Only the map is copied; the
-// committed Table values are immutable and safe to read without the lock.
-func (e *Engine) snapshot() map[string]*Table {
+// snapshot returns a view of the committed tables and indexes. Only the maps
+// are copied; the committed values are immutable and safe to read without the
+// lock.
+func (e *Engine) snapshot() (map[string]*Table, map[string]*Index) {
 	e.lock.Lock()
 	defer e.lock.Unlock()
-	m := make(map[string]*Table, len(e.tables))
+	tm := make(map[string]*Table, len(e.tables))
 	for name, t := range e.tables {
-		m[name] = t
+		tm[name] = t
 	}
-	return m
+	im := make(map[string]*Index, len(e.indexes))
+	for name, i := range e.indexes {
+		im[name] = i
+	}
+	return tm, im
 }
 
-// cloneTables deep-copies a table set so a transaction can mutate its own
-// working copy without disturbing the committed state.
-func cloneTables(src map[string]*Table) map[string]*Table {
-	dst := make(map[string]*Table, len(src))
-	for name, t := range src {
-		dst[name] = t.clone()
+// cloneState deep-copies a table and index set so a transaction can mutate its
+// own working copy without disturbing the committed state.
+func cloneState(tables map[string]*Table, indexes map[string]*Index) (map[string]*Table, map[string]*Index) {
+	td := make(map[string]*Table, len(tables))
+	for name, t := range tables {
+		td[name] = t.clone()
 	}
-	return dst
+	id := make(map[string]*Index, len(indexes))
+	for name, i := range indexes {
+		cp := *i
+		cp.Columns = append([]string(nil), i.Columns...)
+		id[name] = &cp
+	}
+	return td, id
 }
 
 func (t *Table) clone() *Table {
-	cp := &Table{Name: t.Name, Columns: make([]Column, len(t.Columns))}
+	cp := &Table{Name: t.Name, Columns: make([]Column, len(t.Columns)), SQL: t.SQL}
 	copy(cp.Columns, t.Columns)
 	cp.Rows = make([][]Value, len(t.Rows))
 	for i := range t.Rows {
@@ -107,6 +120,7 @@ type Conn struct {
 // committed state with this copy; a rollback discards it.
 type txState struct {
 	tables    map[string]*Table
+	indexes   map[string]*Index
 	implicit  bool // autocommit transaction: one statement, closed immediately
 	writeHeld bool
 }
@@ -120,28 +134,32 @@ func (c *Conn) Execute(sql string) (*Result, error) {
 	p := &parser{toks: toks}
 	switch strings.ToUpper(p.peek().text) {
 	case "CREATE":
-		return c.execWrite(func(tbls map[string]*Table) (*Result, error) {
-			return parseCreate(p, tbls)
+		return c.execWrite(func(tbls map[string]*Table, idx map[string]*Index) (*Result, error) {
+			return parseCreate(p, tbls, idx)
 		})
 	case "INSERT":
-		return c.execWrite(func(tbls map[string]*Table) (*Result, error) {
-			return parseInsert(p, tbls)
+		return c.execWrite(func(tbls map[string]*Table, idx map[string]*Index) (*Result, error) {
+			return parseInsert(p, tbls, idx)
 		})
 	case "SELECT":
-		return c.execRead(func(tbls map[string]*Table) (*Result, error) {
-			return parseSelect(p, tbls)
+		return c.execRead(func(tbls map[string]*Table, idx map[string]*Index) (*Result, error) {
+			return parseSelect(p, tbls, idx)
 		})
 	case "UPDATE":
-		return c.execWrite(func(tbls map[string]*Table) (*Result, error) {
+		return c.execWrite(func(tbls map[string]*Table, idx map[string]*Index) (*Result, error) {
 			return parseUpdate(p, tbls)
 		})
 	case "DELETE":
-		return c.execWrite(func(tbls map[string]*Table) (*Result, error) {
+		return c.execWrite(func(tbls map[string]*Table, idx map[string]*Index) (*Result, error) {
 			return parseDelete(p, tbls)
 		})
+	case "ALTER":
+		return c.execWrite(func(tbls map[string]*Table, idx map[string]*Index) (*Result, error) {
+			return parseAlter(p, tbls, idx)
+		})
 	case "DROP":
-		return c.execWrite(func(tbls map[string]*Table) (*Result, error) {
-			return parseDrop(p, tbls)
+		return c.execWrite(func(tbls map[string]*Table, idx map[string]*Index) (*Result, error) {
+			return parseDrop(p, tbls, idx)
 		})
 	case "BEGIN":
 		return c.execBegin(p)
@@ -162,9 +180,9 @@ func (c *Conn) Execute(sql string) (*Result, error) {
 // execRead runs a read-only statement against the table set this connection
 // currently sees: its own transaction copy if inside one, else the committed
 // state. Reads never take the write lock.
-func (c *Conn) execRead(run func(map[string]*Table) (*Result, error)) (*Result, error) {
+func (c *Conn) execRead(run func(map[string]*Table, map[string]*Index) (*Result, error)) (*Result, error) {
 	if c.tx != nil && !c.tx.implicit {
-		return run(c.tx.tables)
+		return run(c.tx.tables, c.tx.indexes)
 	}
 	return run(c.eng.snapshot())
 }
@@ -173,12 +191,12 @@ func (c *Conn) execRead(run func(map[string]*Table) (*Result, error)) (*Result, 
 // on the transaction's copy; otherwise an implicit transaction is opened for
 // the single statement and committed on success / discarded on failure, which
 // gives statement-level atomicity. Writes take the shared write lock.
-func (c *Conn) execWrite(run func(map[string]*Table) (*Result, error)) (*Result, error) {
-	tbls, err := c.writeTables()
+func (c *Conn) execWrite(run func(map[string]*Table, map[string]*Index) (*Result, error)) (*Result, error) {
+	tbls, idx, err := c.writeTables()
 	if err != nil {
 		return nil, err
 	}
-	res, err := run(tbls)
+	res, err := run(tbls, idx)
 	if err != nil {
 		// A failed statement leaves no partial change: in autocommit discard
 		// the working copy and release the write lock.
@@ -196,21 +214,24 @@ func (c *Conn) execWrite(run func(map[string]*Table) (*Result, error)) (*Result,
 	return res, nil
 }
 
-// writeTables returns the table set a writing statement operates on, taking the
-// write lock. Inside an explicit transaction this is the transaction copy; in
-// autocommit a throwaway transaction is opened for this one statement.
-func (c *Conn) writeTables() (map[string]*Table, error) {
+// writeTables returns the table and index set a writing statement operates on,
+// taking the write lock. Inside an explicit transaction this is the
+// transaction copy; in autocommit a throwaway transaction is opened for this
+// one statement.
+func (c *Conn) writeTables() (map[string]*Table, map[string]*Index, error) {
 	if c.tx != nil && !c.tx.implicit {
 		if err := c.acquireWrite(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return c.tx.tables, nil
+		return c.tx.tables, c.tx.indexes, nil
 	}
 	if err := c.acquireWrite(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	c.tx = &txState{tables: cloneTables(c.eng.snapshot()), implicit: true, writeHeld: true}
-	return c.tx.tables, nil
+	tt, ii := c.eng.snapshot()
+	ct, ci := cloneState(tt, ii)
+	c.tx = &txState{tables: ct, indexes: ci, implicit: true, writeHeld: true}
+	return c.tx.tables, c.tx.indexes, nil
 }
 
 // acquireWrite takes the write lock for this connection. It is idempotent for
@@ -242,6 +263,7 @@ func (c *Conn) flush() error {
 	e := c.eng
 	e.lock.Lock()
 	e.tables = c.tx.tables
+	e.indexes = c.tx.indexes
 	e.lock.Unlock()
 	c.releaseWrite()
 	c.tx = nil
@@ -251,7 +273,8 @@ func (c *Conn) flush() error {
 	return nil
 }
 
-// execBegin starts an explicit transaction by snapshotting the committed state.
+// execBegin starts an explicit transaction by snapshotting the committed state
+// and cloning it, so the transaction can mutate its own private copy.
 func (c *Conn) execBegin(p *parser) (*Result, error) {
 	p.next() // BEGIN
 	if err := p.checkTrailing(); err != nil {
@@ -260,7 +283,9 @@ func (c *Conn) execBegin(p *parser) (*Result, error) {
 	if c.tx != nil {
 		return nil, &SQLError{Message: "cannot start a transaction within a transaction"}
 	}
-	c.tx = &txState{tables: cloneTables(c.eng.snapshot())}
+	tt, ii := c.eng.snapshot()
+	ct, ci := cloneState(tt, ii)
+	c.tx = &txState{tables: ct, indexes: ci}
 	return &Result{}, nil
 }
 
