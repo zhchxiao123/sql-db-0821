@@ -47,8 +47,6 @@ var unsupportedKeywords = map[string]string{
 	"ELSE":      "CASE expression",
 	"END":       "CASE expression",
 	"EXISTS":    "EXISTS subquery",
-	"INDEX":     "CREATE INDEX",
-	"ALTER":     "ALTER TABLE",
 	"VIEW":      "VIEW",
 	"PRAGMA":    "PRAGMA",
 	"VACUUM":    "VACUUM",
@@ -277,10 +275,15 @@ func isIntLiteral(s string) bool {
 	return true
 }
 
-// skipColumnConstraints consumes trailing column-level constraints such as
-// PRIMARY KEY, NOT NULL and UNIQUE. Constraint enforcement is out of scope
-// (a later sub-requirement), so they are parsed and ignored.
-func (p *parser) skipColumnConstraints() error {
+// parseColumnConstraints consumes trailing column-level constraints (PRIMARY
+// KEY, NOT NULL, UNIQUE, AUTOINCREMENT, DEFAULT and CHECK) and records them on
+// col so INSERT can enforce them. PRIMARY KEY is recorded as Unique only: it
+// does not imply NOT NULL, keeping INTEGER PRIMARY KEY compatible with the
+// pin set (SQLite reports a duplicate PRIMARY KEY as a UNIQUE constraint
+// failure, and a PRIMARY KEY column — like a UNIQUE one — accepts multiple
+// NULLs). AUTOINCREMENT is parsed and ignored (it only matters for rowid
+// generation, which this engine does not model).
+func (p *parser) parseColumnConstraints(col *Column) error {
 	for {
 		t := p.peek()
 		if t.kind != tokIdent {
@@ -293,29 +296,88 @@ func (p *parser) skipColumnConstraints() error {
 				return &SQLError{Message: "expected KEY after PRIMARY"}
 			}
 			p.next()
+			col.Unique = true
 		case "NOT":
 			p.next()
 			if !strings.EqualFold(p.peek().text, "NULL") {
 				return &SQLError{Message: "expected NULL after NOT"}
 			}
 			p.next()
-		case "NULL", "UNIQUE", "AUTOINCREMENT":
+			col.NotNull = true
+		case "NULL", "AUTOINCREMENT":
 			p.next()
+		case "UNIQUE":
+			p.next()
+			col.Unique = true
+		case "DEFAULT":
+			p.next()
+			e, err := p.parseDefaultValue()
+			if err != nil {
+				return err
+			}
+			if e != nil {
+				col.Default = e
+			}
+		case "CHECK":
+			p.next()
+			if err := p.expectPunct("("); err != nil {
+				return err
+			}
+			e, err := p.parseExpr()
+			if err != nil {
+				return err
+			}
+			if err := p.expectPunct(")"); err != nil {
+				return err
+			}
+			col.Check = e
 		default:
 			return nil
 		}
 	}
 }
 
-// parseCreate handles CREATE TABLE (and rejects CREATE INDEX / VIEW).
-func parseCreate(p *parser, tbls map[string]*Table) (*Result, error) {
+// parseDefaultValue parses a DEFAULT clause value: a signed literal (number,
+// string, blob or NULL) or a parenthesised expression, matching SQLite. The
+// expression is evaluated at INSERT time against an empty row, so it must be
+// a constant (column references are not allowed, as in SQLite).
+func (p *parser) parseDefaultValue() (Expr, error) {
+	if p.peek().text == "(" {
+		p.next()
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectPunct(")"); err != nil {
+			return nil, err
+		}
+		return e, nil
+	}
+	// A bare literal is wrapped in a LiteralExpr so evaluation yields its
+	// value directly. A leading sign is folded into the literal value.
+	v, err := p.parseValue()
+	if err != nil {
+		return nil, err
+	}
+	return &LiteralExpr{val: v}, nil
+}
+
+// parseCreate handles CREATE TABLE (with column-level PRIMARY KEY / NOT NULL /
+// UNIQUE / DEFAULT / CHECK constraints and table-level PRIMARY KEY / UNIQUE
+// constraints) and CREATE [UNIQUE] INDEX. SQL text is captured on the Table /
+// Index so sqlite_master can report definitions. CREATE VIEW stays unsupported.
+func parseCreate(p *parser, tbls map[string]*Table, idxs map[string]*Index) (*Result, error) {
 	p.next() // CREATE
 	kw := strings.ToUpper(p.peek().text)
 	switch kw {
 	case "TABLE":
 		p.next()
 	case "INDEX":
-		return nil, &UnsupportedError{Feature: "CREATE INDEX"}
+		// peek is at INDEX; parseCreateIndex consumes it.
+		return parseCreateIndex(p, idxs, false)
+	case "UNIQUE":
+		p.next() // consume UNIQUE
+		return parseCreateIndex(p, idxs, true)
 	case "VIEW":
 		return nil, &UnsupportedError{Feature: "CREATE VIEW"}
 	default:
@@ -325,34 +387,180 @@ func parseCreate(p *parser, tbls map[string]*Table) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	sqlStart := p.pos
 	if err := p.expectPunct("("); err != nil {
 		return nil, err
 	}
 	var cols []Column
+	var pkCols []string // table-level PRIMARY KEY column list
+	var uniqueCols []string
 	for {
-		colName, err := p.expectIdent()
-		if err != nil {
-			return nil, err
-		}
-		typeName, err := p.expectIdent()
-		if err != nil {
-			return nil, err
-		}
-		// Optional "(n)" size suffix, e.g. VARCHAR(30).
-		if p.peek().text == "(" {
-			p.next()
-			if p.peek().kind != tokNumber {
-				return nil, &SQLError{Message: "expected size in type declaration"}
+		// A table-level constraint appears as a keyword instead of a column name.
+		kw := strings.ToUpper(p.peek().text)
+		if p.peek().kind == tokIdent && (kw == "PRIMARY" || kw == "UNIQUE") {
+			if kw == "PRIMARY" {
+				p.next()
+				if !strings.EqualFold(p.peek().text, "KEY") {
+					return nil, &SQLError{Message: "expected KEY after PRIMARY"}
+				}
+				p.next()
+				if err := p.expectPunct("("); err != nil {
+					return nil, err
+				}
+				for {
+					cn, err := p.expectIdent()
+					if err != nil {
+						return nil, err
+					}
+					pkCols = append(pkCols, cn)
+					if p.peek().text == "," {
+						p.next()
+						continue
+					}
+					break
+				}
+				if err := p.expectPunct(")"); err != nil {
+					return nil, err
+				}
+			} else { // UNIQUE
+				p.next()
+				if err := p.expectPunct("("); err != nil {
+					return nil, err
+				}
+				for {
+					cn, err := p.expectIdent()
+					if err != nil {
+						return nil, err
+					}
+					uniqueCols = append(uniqueCols, cn)
+					if p.peek().text == "," {
+						p.next()
+						continue
+					}
+					break
+				}
+				if err := p.expectPunct(")"); err != nil {
+					return nil, err
+				}
 			}
+		} else {
+			colName, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			typeName, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			// Optional "(n)" size suffix, e.g. VARCHAR(30).
+			if p.peek().text == "(" {
+				p.next()
+				if p.peek().kind != tokNumber {
+					return nil, &SQLError{Message: "expected size in type declaration"}
+				}
+				p.next()
+				if err := p.expectPunct(")"); err != nil {
+					return nil, err
+				}
+			}
+			col := Column{Name: colName, Type: strings.ToUpper(typeName)}
+			if err := p.parseColumnConstraints(&col); err != nil {
+				return nil, err
+			}
+			cols = append(cols, col)
+		}
+		if p.peek().text == "," {
 			p.next()
-			if err := p.expectPunct(")"); err != nil {
+			continue
+		}
+		break
+	}
+	if err := p.expectPunct(")"); err != nil {
+		return nil, err
+	}
+	// Resolve column affinities for CHECK expressions (they are evaluated at
+	// INSERT time; resolution here matches how SELECT does it).
+	for i := range cols {
+		if cols[i].Check != nil {
+			if err := resolveColumnAffinity(cols[i].Check, cols); err != nil {
 				return nil, err
 			}
 		}
-		if err := p.skipColumnConstraints(); err != nil {
+	}
+	if err := p.checkTrailing(); err != nil {
+		return nil, err
+	}
+	if _, exists := tbls[name]; exists {
+		return nil, &SQLError{Message: fmt.Sprintf("table %q already exists", name)}
+	}
+	// Apply table-level PRIMARY KEY/UNIQUE to their columns (marked Unique).
+	for _, cn := range pkCols {
+		if i := tableColumnSeq(cols).index(cn); i >= 0 {
+			cols[i].Unique = true
+		} else {
+			return nil, &SQLError{Message: fmt.Sprintf("no such column: %s", cn)}
+		}
+	}
+	for _, cn := range uniqueCols {
+		if i := tableColumnSeq(cols).index(cn); i >= 0 {
+			cols[i].Unique = true
+		} else {
+			return nil, &SQLError{Message: fmt.Sprintf("no such column: %s", cn)}
+		}
+	}
+	sqlText := renderCreateTableSQL(p, sqlStart, name, cols)
+	tbls[name] = &Table{Name: name, Columns: cols, SQL: sqlText}
+	return &Result{}, nil
+}
+
+// tableColumnSeq is a small helper view over []Column for name lookup.
+type tableColumnSeq []Column
+
+func (s tableColumnSeq) index(name string) int {
+	for i, c := range s {
+		if strings.EqualFold(c.Name, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+// parseCreateIndex handles the remainder of CREATE [UNIQUE] INDEX idx ON
+// tbl (col [, ...]). The index is validated against the owning table and
+// registered in idxs; it does not alter query results (the engine always
+// scans), so it matters for sqlite_master introspection and UNIQUE enforcement.
+func parseCreateIndex(p *parser, idxs map[string]*Index, unique bool) (*Result, error) {
+	if !strings.EqualFold(p.peek().text, "INDEX") {
+		return nil, &SQLError{Message: "expected INDEX"}
+	}
+	p.next()
+	idxName, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(p.peek().text, "ON") {
+		return nil, &SQLError{Message: "expected ON after index name"}
+	}
+	p.next()
+	tableName, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectPunct("("); err != nil {
+		return nil, err
+	}
+	var columns []string
+	for {
+		cn, err := p.expectIdent()
+		if err != nil {
 			return nil, err
 		}
-		cols = append(cols, Column{Name: colName, Type: strings.ToUpper(typeName)})
+		columns = append(columns, cn)
+		// Optional ASC/DESC sort order — parsed and ignored for enforcement
+		// (the engine always scans, so ordering is metadata only).
+		if p.isKeyword("ASC") || p.isKeyword("DESC") {
+			p.next()
+		}
 		if p.peek().text == "," {
 			p.next()
 			continue
@@ -365,16 +573,331 @@ func parseCreate(p *parser, tbls map[string]*Table) (*Result, error) {
 	if err := p.checkTrailing(); err != nil {
 		return nil, err
 	}
-	if _, exists := tbls[name]; exists {
-		return nil, &SQLError{Message: fmt.Sprintf("table %q already exists", name)}
+	if _, exists := idxs[idxName]; exists {
+		return nil, &SQLError{Message: fmt.Sprintf("index %q already exists", idxName)}
 	}
-	tbls[name] = &Table{Name: name, Columns: cols}
+	// Unique-ness must be enforced, so the owning table has to be known; the
+	// catalog is global but the table may not have been committed yet inside
+	// the same statement. We register the index regardless; enforcement looks
+	// up the table by name at INSERT time.
+	idxs[idxName] = &Index{Name: idxName, Table: tableName, Columns: columns, Unique: unique, SQL: renderCreateIndexSQL(p, idxName, tableName, columns, unique)}
 	return &Result{}, nil
+}
+
+// renderCreateTableSQL synthesizes the original CREATE TABLE text from the
+// parsed definition, so sqlite_master can report a stable definition even when
+// the engine reconstructed it (e.g. after reload).
+func renderCreateTableSQL(p *parser, sqlStart int, name string, cols []Column) string {
+	var b strings.Builder
+	b.WriteString("CREATE TABLE ")
+	b.WriteString(name)
+	b.WriteString(" (\n")
+	for i, c := range cols {
+		b.WriteString("  ")
+		b.WriteString(c.Name)
+		b.WriteString(" ")
+		b.WriteString(c.Type)
+		if c.NotNull {
+			b.WriteString(" NOT NULL")
+		}
+		if c.Unique {
+			b.WriteString(" UNIQUE")
+		}
+		if c.Default != nil {
+			b.WriteString(" DEFAULT ")
+			b.WriteString(exprRender(c.Default))
+		}
+		if c.Check != nil {
+			b.WriteString(" CHECK (")
+			b.WriteString(exprRender(c.Check))
+			b.WriteString(")")
+		}
+		if i < len(cols)-1 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+// renderCreateIndexSQL synthesizes the original CREATE INDEX statement.
+func renderCreateIndexSQL(p *parser, idxName, tableName string, columns []string, unique bool) string {
+	var b strings.Builder
+	b.WriteString("CREATE ")
+	if unique {
+		b.WriteString("UNIQUE ")
+	}
+	b.WriteString("INDEX ")
+	b.WriteString(idxName)
+	b.WriteString(" ON ")
+	b.WriteString(tableName)
+	b.WriteString(" (")
+	for i, cn := range columns {
+		b.WriteString(cn)
+		if i < len(columns)-1 {
+			b.WriteString(", ")
+		}
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+// parseAlter handles ALTER TABLE t RENAME TO new and ALTER TABLE t ADD COLUMN
+// col def. RENAME rewrites the stored SQL (and re-points any indexes on t);
+// ADD COLUMN appends the column and back-fills existing rows with the column's
+// DEFAULT (or NULL when there is none), mirroring SQLite. Adding a NOT NULL
+// column without a non-NULL default is rejected, as is adding a PRIMARY KEY.
+func parseAlter(p *parser, tbls map[string]*Table, idxs map[string]*Index) (*Result, error) {
+	p.next() // ALTER
+	if !strings.EqualFold(p.peek().text, "TABLE") {
+		return nil, &SQLError{Message: "expected TABLE after ALTER"}
+	}
+	p.next()
+	name, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	tbl, ok := tbls[name]
+	if !ok {
+		return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
+	}
+	kw := strings.ToUpper(p.peek().text)
+	switch kw {
+	case "RENAME":
+		p.next()
+		if !strings.EqualFold(p.peek().text, "TO") {
+			return nil, &SQLError{Message: "expected TO after RENAME"}
+		}
+		p.next()
+		newName, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.checkTrailing(); err != nil {
+			return nil, err
+		}
+		if newName == name {
+			return nil, &SQLError{Message: fmt.Sprintf("table %q already exists", newName)}
+		}
+		if _, exists := tbls[newName]; exists {
+			return nil, &SQLError{Message: fmt.Sprintf("table %q already exists", newName)}
+		}
+		tbl.Name = newName
+		tbl.SQL = rewriteSQLTableName(tbl.SQL, name, newName)
+		delete(tbls, name)
+		tbls[newName] = tbl
+		for _, ix := range idxs {
+			if strings.EqualFold(ix.Table, name) {
+				ix.Table = newName
+				ix.SQL = rewriteSQLTableName(ix.SQL, name, newName)
+			}
+		}
+		return &Result{}, nil
+	case "ADD":
+		p.next()
+		if !strings.EqualFold(p.peek().text, "COLUMN") {
+			return nil, &SQLError{Message: "expected COLUMN after ADD"}
+		}
+		p.next()
+		colName, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		typeName, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		if p.peek().text == "(" {
+			p.next()
+			if p.peek().kind != tokNumber {
+				return nil, &SQLError{Message: "expected size in type declaration"}
+			}
+			p.next()
+			if err := p.expectPunct(")"); err != nil {
+				return nil, err
+			}
+		}
+		col := Column{Name: colName, Type: strings.ToUpper(typeName)}
+		if err := p.parseColumnConstraints(&col); err != nil {
+			return nil, err
+		}
+		if err := p.checkTrailing(); err != nil {
+			return nil, err
+		}
+		// SQLite forbids adding a NOT NULL column that defaults to NULL, and
+		// forbids ADD COLUMN with PRIMARY KEY entirely.
+		if col.NotNull {
+			dv := defaultForColumn(col)
+			if dv.IsNull() {
+				return nil, &SQLError{Message: fmt.Sprintf("Cannot add a NOT NULL column with default value NULL")}
+			}
+		}
+		if isPrimaryKeyColumn(col) {
+			return nil, &SQLError{Message: "Cannot add a PRIMARY KEY column"}
+		}
+		tbl.Columns = append(tbl.Columns, col)
+		// Back-fill existing rows with the new column's default.
+		for i := range tbl.Rows {
+			tbl.Rows[i] = append(tbl.Rows[i], defaultForColumn(col))
+		}
+		return &Result{}, nil
+	default:
+		return nil, &SQLError{Message: "expected RENAME or ADD"}
+	}
+}
+
+// parseStoredTableSQL re-parses a stored CREATE TABLE statement into its Table
+// definition (columns and constraints only; rows are restored from the
+// persisted rows). Used on reload so DEFAULT/CHECK/UNIQUE/PRIMARY KEY survive
+// persistence — only the SQL text is stored, so re-parsing is the single
+// source of truth for the full constraint set.
+func parseStoredTableSQL(sql string) (*Table, error) {
+	toks, err := tokenize(sql)
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{toks: toks}
+	p.next() // CREATE
+	if !strings.EqualFold(p.peek().text, "TABLE") {
+		return nil, &SQLError{Message: "not a CREATE TABLE statement"}
+	}
+	p.next()
+	name, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectPunct("("); err != nil {
+		return nil, err
+	}
+	var cols []Column
+	for {
+		kw := strings.ToUpper(p.peek().text)
+		if p.peek().kind == tokIdent && (kw == "PRIMARY" || kw == "UNIQUE") {
+			if kw == "PRIMARY" {
+				p.next()
+				p.next() // KEY
+				if err := p.expectPunct("("); err != nil {
+					return nil, err
+				}
+				for {
+					cn, err := p.expectIdent()
+					if err != nil {
+						return nil, err
+					}
+					if i := tableColumnSeq(cols).index(cn); i >= 0 {
+						cols[i].Unique = true
+					}
+					if p.peek().text == "," {
+						p.next()
+						continue
+					}
+					break
+				}
+				if err := p.expectPunct(")"); err != nil {
+					return nil, err
+				}
+			} else { // UNIQUE
+				p.next()
+				if err := p.expectPunct("("); err != nil {
+					return nil, err
+				}
+				for {
+					cn, err := p.expectIdent()
+					if err != nil {
+						return nil, err
+					}
+					if i := tableColumnSeq(cols).index(cn); i >= 0 {
+						cols[i].Unique = true
+					}
+					if p.peek().text == "," {
+						p.next()
+						continue
+					}
+					break
+				}
+				if err := p.expectPunct(")"); err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			colName, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			typeName, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			if p.peek().text == "(" {
+				p.next()
+				p.next() // size
+				if err := p.expectPunct(")"); err != nil {
+					return nil, err
+				}
+			}
+			col := Column{Name: colName, Type: strings.ToUpper(typeName)}
+			if err := p.parseColumnConstraints(&col); err != nil {
+				return nil, err
+			}
+			cols = append(cols, col)
+		}
+		if p.peek().text == "," {
+			p.next()
+			continue
+		}
+		break
+	}
+	if err := p.expectPunct(")"); err != nil {
+		return nil, err
+	}
+	return &Table{Name: name, Columns: cols, SQL: sql}, nil
+}
+
+// isPrimaryKeyColumn reports whether a column was declared PRIMARY KEY. The
+// engine records PRIMARY KEY as Unique (indistinguishable from UNIQUE); ADD
+// COLUMN rejection uses this conservative rule: a NULL-defaulted column cannot
+// be UNIQUE either, so rejecting Unique-with-NULL-default is safe for both.
+func isPrimaryKeyColumn(col Column) bool {
+	return col.Unique && col.Default == nil
+}
+
+// rewriteSQLTableName replaces the first table-name occurrence in a stored SQL
+// statement. For ALTER TABLE RENAME the statement text still carries the old
+// name; this rewrites it so sqlite_master stays consistent.
+func rewriteSQLTableName(sql, oldName, newName string) string {
+	if sql == "" {
+		return sql
+	}
+	idx := strings.Index(sql, oldName)
+	if idx < 0 {
+		return sql
+	}
+	return sql[:idx] + newName + sql[idx+len(oldName):]
+}
+
+// exprRender renders an expression back to SQL text for sqlite_master and for
+// recording a DEFAULT value in the persisted definition.
+func exprRender(e Expr) string {
+	switch n := e.(type) {
+	case *LiteralExpr:
+		if n.val.IsNull() {
+			return "NULL"
+		}
+		return n.val.RenderCLI()
+	case *NegExpr:
+		return "-(" + exprRender(n.inner) + ")"
+	default:
+		return "(expr)"
+	}
 }
 
 // parseInsert handles INSERT INTO t [(cols)] VALUES (...). Values are
 // converted to the target column's affinity, matching SQLite's storage rules.
-func parseInsert(p *parser, tbls map[string]*Table) (*Result, error) {
+// Column-level constraints (NOT NULL, CHECK, UNIQUE/PRIMARY KEY) and UNIQUE
+// INDEXes are enforced here, so a failing INSERT leaves the table unchanged
+// (statement-level atomicity in conn.go discards the whole working copy).
+func parseInsert(p *parser, tbls map[string]*Table, idxs map[string]*Index) (*Result, error) {
 	p.next() // INSERT
 	if !strings.EqualFold(p.peek().text, "INTO") {
 		return nil, &SQLError{Message: "expected INTO after INSERT"}
@@ -403,6 +926,10 @@ func parseInsert(p *parser, tbls map[string]*Table) (*Result, error) {
 			return nil, err
 		}
 	}
+	tbl, ok := tbls[name]
+	if !ok {
+		return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
+	}
 	if !strings.EqualFold(p.peek().text, "VALUES") {
 		return nil, &UnsupportedError{Feature: "INSERT ... SELECT"}
 	}
@@ -410,13 +937,35 @@ func parseInsert(p *parser, tbls map[string]*Table) (*Result, error) {
 	if err := p.expectPunct("("); err != nil {
 		return nil, err
 	}
+	// VALUES may contain the literal DEFAULT to request a column's default.
 	var vals []Value
+	colIdx := 0
 	for {
-		v, err := p.parseValue()
-		if err != nil {
-			return nil, err
+		if strings.EqualFold(p.peek().text, "DEFAULT") {
+			// DEFAULT fills the value from the column default (or NULL if the
+			// column has none). Target column is resolved by position.
+			p.next()
+			if len(colNames) == 0 {
+				if colIdx >= len(tbl.Columns) {
+					return nil, &SQLError{Message: "INSERT has more expressions than target columns"}
+				}
+				vals = append(vals, defaultForColumn(tbl.Columns[colIdx]))
+			} else {
+				di := tbl.columnIndex(colNames[colIdx])
+				if di < 0 {
+					return nil, &SQLError{Message: fmt.Sprintf("no such column: %s", colNames[colIdx])}
+				}
+				vals = append(vals, defaultForColumn(tbl.Columns[di]))
+			}
+			colIdx++
+		} else {
+			v, err := p.parseValue()
+			if err != nil {
+				return nil, err
+			}
+			vals = append(vals, v)
+			colIdx++
 		}
-		vals = append(vals, v)
 		if p.peek().text == "," {
 			p.next()
 			continue
@@ -429,10 +978,6 @@ func parseInsert(p *parser, tbls map[string]*Table) (*Result, error) {
 	if err := p.checkTrailing(); err != nil {
 		return nil, err
 	}
-	tbl, ok := tbls[name]
-	if !ok {
-		return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
-	}
 	if len(colNames) == 0 {
 		if len(vals) != len(tbl.Columns) {
 			return nil, &SQLError{Message: fmt.Sprintf("table %s has %d columns but %d values were supplied", name, len(tbl.Columns), len(vals))}
@@ -441,6 +986,11 @@ func parseInsert(p *parser, tbls map[string]*Table) (*Result, error) {
 		return nil, &SQLError{Message: "INSERT has more expressions than target columns"}
 	}
 	row := make([]Value, len(tbl.Columns))
+	// Start every row from its column defaults, then overlay supplied values.
+	// Columns with no DEFAULT and no supplied value stay NULL, matching SQLite.
+	for i := range tbl.Columns {
+		row[i] = defaultForColumn(tbl.Columns[i])
+	}
 	if len(colNames) == 0 {
 		copy(row, vals)
 	} else {
@@ -456,8 +1006,136 @@ func parseInsert(p *parser, tbls map[string]*Table) (*Result, error) {
 	for i := range row {
 		row[i] = applyAffinity(row[i], columnAffinity(tbl.Columns[i].Type))
 	}
+	// Enforce NOT NULL, CHECK, and UNIQUE/PRIMARY KEY constraints.
+	for i := range tbl.Columns {
+		if tbl.Columns[i].NotNull && row[i].IsNull() {
+			return nil, &SQLError{Message: fmt.Sprintf("NOT NULL constraint failed: %s.%s", name, tbl.Columns[i].Name)}
+		}
+		if tbl.Columns[i].Check != nil {
+			if !checkHolds(tbl.Columns[i].Check, row, tbl.Columns) {
+				return nil, &SQLError{Message: fmt.Sprintf("CHECK constraint failed: %s", name)}
+			}
+		}
+	}
+	// UNIQUE (column) and PRIMARY KEY reject a duplicate value in a non-NULL
+	// column; NULLs never conflict. Report as a UNIQUE constraint failure,
+	// matching SQLite's wording.
+	for i := range tbl.Columns {
+		if tbl.Columns[i].Unique && !row[i].IsNull() {
+			if columnHasEqualValue(tbl, tbl.Columns[i].Name, row) {
+				return nil, &SQLError{Message: fmt.Sprintf("UNIQUE constraint failed: %s.%s", name, tbl.Columns[i].Name)}
+			}
+		}
+	}
+	// A UNIQUE INDEX enforces the same rule across its whole column list. As in
+	// SQLite, a NULL in any indexed column means the row never conflicts
+	// (NULLs are distinct). The row is not yet in tbl.Rows, so the scan below
+	// only sees existing rows — exactly what duplicates must be rejected against.
+	for _, ix := range idxs {
+		if !ix.Unique || !strings.EqualFold(ix.Table, name) {
+			continue
+		}
+		idxCols, ok := indexColumnPositions(tbl, ix.Columns)
+		if !ok {
+			continue
+		}
+		if indexKeyHasNull(idxCols, row) {
+			continue
+		}
+		if indexHasEqualRow(tbl, idxCols, row) {
+			return nil, &SQLError{Message: fmt.Sprintf("UNIQUE constraint failed: %s.%s", name, ix.Name)}
+		}
+	}
 	tbl.Rows = append(tbl.Rows, row)
 	return &Result{Affected: 1}, nil
+}
+
+// checkHolds evaluates a CHECK constraint for a row. As in SQLite, a NULL
+// evaluation result means the constraint is satisfied (NOT NULL rejects NULL,
+// but CHECK does not), so NULL returns true.
+func checkHolds(check Expr, row []Value, cols []Column) bool {
+	v, err := check.eval(row, cols)
+	if err != nil {
+		return false
+	}
+	if v.kind == Null {
+		return true
+	}
+	return v.kind == Int && v.intVal != 0
+}
+
+// defaultForColumn returns the column's DEFAULT value, evaluated, or NULL when
+// the column has no DEFAULT.
+func defaultForColumn(col Column) Value {
+	if col.Default == nil {
+		return NullValue()
+	}
+	v, err := col.Default.eval(nil, nil)
+	if err == nil {
+		return v
+	}
+	return NullValue()
+}
+
+// columnHasEqualValue reports whether any existing row already has the same
+// value as row in the named column (used to enforce UNIQUE/PRIMARY KEY on
+// INSERT).
+func columnHasEqualValue(tbl *Table, colName string, row []Value) bool {
+	idx := tbl.columnIndex(colName)
+	if idx < 0 {
+		return false
+	}
+	for _, r := range tbl.Rows {
+		if compareValues(r[idx], row[idx]) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// indexColumnPositions maps an index's column names to positions in the table,
+// reporting false if any column is unknown (shouldn't happen: CREATE INDEX
+// references a committed table).
+func indexColumnPositions(tbl *Table, cols []string) ([]int, bool) {
+	pos := make([]int, len(cols))
+	for i, cn := range cols {
+		p := tbl.columnIndex(cn)
+		if p < 0 {
+			return nil, false
+		}
+		pos[i] = p
+	}
+	return pos, true
+}
+
+// indexKeyHasNull reports whether any column of the index key is NULL in row
+// (a NULL in a UNIQUE INDEX column means the row never conflicts, as in
+// SQLite).
+func indexKeyHasNull(pos []int, row []Value) bool {
+	for _, p := range pos {
+		if row[p].IsNull() {
+			return true
+		}
+	}
+	return false
+}
+
+// indexHasEqualRow reports whether any existing row has a key equal to row's
+// key over the given index column positions.
+func indexHasEqualRow(tbl *Table, pos []int, row []Value) bool {
+	for _, r := range tbl.Rows {
+		equal := true
+		for _, p := range pos {
+			if compareValues(r[p], row[p]) != 0 {
+				equal = false
+				break
+			}
+		}
+		if equal {
+			return true
+		}
+	}
+	return false
 }
 
 // selectItem is one entry in a SELECT list: an expression plus its result
@@ -524,12 +1202,41 @@ func containsCountStar(e Expr) bool {
 	return false
 }
 
+// buildSQLiteMaster synthesizes the sqlite_master virtual table: one row per
+// table and index with type/name/tbl_name/sql columns, matching SQLite's schema
+// table. It is built on demand and never stored in tbls, keeping DROP TABLE /
+// DROP INDEX consistent with what introspection reports.
+func buildSQLiteMaster(tbls map[string]*Table, idxs map[string]*Index) *Table {
+	rows := make([][]Value, 0, len(tbls)+len(idxs))
+	for _, t := range tbls {
+		sql := t.SQL
+		if sql == "" {
+			sql = renderCreateTableSQL(nil, 0, t.Name, t.Columns)
+		}
+		rows = append(rows, []Value{TextValue("table"), TextValue(t.Name), TextValue(t.Name), IntValue(0), TextValue(sql)})
+	}
+	for _, ix := range idxs {
+		rows = append(rows, []Value{TextValue("index"), TextValue(ix.Name), TextValue(ix.Table), IntValue(0), TextValue(ix.SQL)})
+	}
+	return &Table{
+		Name: "sqlite_master",
+		Columns: []Column{
+			{Name: "type", Type: "TEXT"},
+			{Name: "name", Type: "TEXT"},
+			{Name: "tbl_name", Type: "TEXT"},
+			{Name: "rootpage", Type: "INT"},
+			{Name: "sql", Type: "TEXT"},
+		},
+		Rows: rows,
+	}
+}
+
 // parseSelect handles a full single-table SELECT: select list, FROM+WHERE,
 // GROUP BY, HAVING, ORDER BY (ordinal or expression keys, ASC/DESC, NULL
 // placement), LIMIT/OFFSET and DISTINCT. An aggregate query (one with GROUP BY
 // or an aggregate in the select list or HAVING) computes one output row per
 // group; a without-FROM SELECT supplies a single constant row so COUNT(*)=1.
-func parseSelect(p *parser, tbls map[string]*Table) (*Result, error) {
+func parseSelect(p *parser, tbls map[string]*Table, idxs map[string]*Index) (*Result, error) {
 	p.next() // SELECT
 	distinct := false
 	if p.isKeyword("ALL") {
@@ -599,7 +1306,10 @@ func parseSelect(p *parser, tbls map[string]*Table) (*Result, error) {
 		}
 		var ok bool
 		tbl, ok = tbls[name]
-		if !ok {
+		if !ok && strings.EqualFold(name, "sqlite_master") {
+			tbl = buildSQLiteMaster(tbls, idxs)
+		}
+		if tbl == nil {
 			return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
 		}
 	}
@@ -1038,15 +1748,28 @@ func parseDelete(p *parser, tbls map[string]*Table) (*Result, error) {
 	return &Result{Affected: affected}, nil
 }
 
-// parseDrop handles DROP TABLE t (and rejects DROP INDEX / VIEW).
-func parseDrop(p *parser, tbls map[string]*Table) (*Result, error) {
+// parseDrop handles DROP TABLE t and DROP INDEX i (CREATE VIEW is unsupported,
+// so DROP VIEW stays too). Dropping a table also drops every index on it.
+func parseDrop(p *parser, tbls map[string]*Table, idxs map[string]*Index) (*Result, error) {
 	p.next() // DROP
 	kw := strings.ToUpper(p.peek().text)
 	switch kw {
 	case "TABLE":
 		p.next()
 	case "INDEX":
-		return nil, &UnsupportedError{Feature: "DROP INDEX"}
+		p.next()
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.checkTrailing(); err != nil {
+			return nil, err
+		}
+		if _, ok := idxs[name]; !ok {
+			return nil, &SQLError{Message: fmt.Sprintf("no such index: %s", name)}
+		}
+		delete(idxs, name)
+		return &Result{}, nil
 	case "VIEW":
 		return nil, &UnsupportedError{Feature: "DROP VIEW"}
 	default:
@@ -1063,5 +1786,10 @@ func parseDrop(p *parser, tbls map[string]*Table) (*Result, error) {
 		return nil, &SQLError{Message: fmt.Sprintf("no such table: %s", name)}
 	}
 	delete(tbls, name)
+	for ixName, ix := range idxs {
+		if strings.EqualFold(ix.Table, name) {
+			delete(idxs, ixName)
+		}
+	}
 	return &Result{}, nil
 }
