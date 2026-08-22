@@ -1,0 +1,313 @@
+# expr.test — the expression and type-system subset: arithmetic, comparison,
+# logical, IS/IN/BETWEEN/LIKE, CAST, NULL propagation and column affinity.
+# Every expected value below was verified against sqlite3 3.51.0.
+
+# --- constant expressions (acceptance criterion a2) ---
+
+query I
+SELECT 1+2*3
+----
+7
+
+query I
+SELECT 1/0
+----
+NULL
+
+query I
+SELECT 10/3
+----
+3
+
+query I
+SELECT NULL AND 1
+----
+NULL
+
+query I
+SELECT 'a'<'b'
+----
+1
+
+query I
+SELECT CAST('12' AS INTEGER)
+----
+12
+
+query I
+SELECT 'abc' LIKE 'a%'
+----
+1
+
+# --- arithmetic ---
+
+query I
+SELECT 7%3
+----
+1
+
+query I
+SELECT -5+3
+----
+-2
+
+query I
+SELECT -2*3
+----
+-6
+
+query I
+SELECT 1-2-3
+----
+-4
+
+query I
+SELECT 2+3*4
+----
+14
+
+query I
+SELECT (1+2)*3
+----
+9
+
+query I
+SELECT 1 = '1'
+----
+0
+
+query I
+SELECT 2 < '10'
+----
+1
+
+# --- logical and NULL propagation ---
+
+query I
+SELECT 1 OR NULL
+----
+1
+
+query I
+SELECT NOT NULL
+----
+NULL
+
+query I
+SELECT NOT 1
+----
+0
+
+query I
+SELECT 0 AND NULL
+----
+0
+
+query I
+SELECT 1 AND 2
+----
+1
+
+query I
+SELECT NULL IS NULL
+----
+1
+
+query I
+SELECT 1 IS NOT NULL
+----
+1
+
+query I
+SELECT NULL IS NOT NULL
+----
+0
+
+query I
+SELECT 1 IN (1, 2)
+----
+1
+
+query I
+SELECT 3 IN (1, 2)
+----
+0
+
+query I
+SELECT NULL IN (1, NULL)
+----
+NULL
+
+query I
+SELECT 1 IN (1, NULL)
+----
+1
+
+query I
+SELECT 2 NOT IN (1, 3)
+----
+1
+
+query I
+SELECT 5 BETWEEN 1 AND 10
+----
+1
+
+query I
+SELECT 0 BETWEEN 1 AND 10
+----
+0
+
+query I
+SELECT NULL BETWEEN 1 AND 10
+----
+NULL
+
+query I
+SELECT 'abc' LIKE '_b_'
+----
+1
+
+query I
+SELECT 'ABC' LIKE 'abc'
+----
+1
+
+query I
+SELECT 'abc' LIKE 'd%'
+----
+0
+
+# --- CAST ---
+
+query I
+SELECT CAST(1.9 AS INTEGER)
+----
+1
+
+query I
+SELECT CAST('abc' AS INTEGER)
+----
+0
+
+query I
+SELECT CAST('12x' AS INTEGER)
+----
+12
+
+query I
+SELECT CAST(3 AS TEXT)
+----
+3
+
+query R
+SELECT CAST('1.5' AS REAL)
+----
+1.500
+
+# --- integer overflow promotes to REAL, never wraps ---
+
+query R
+SELECT 9223372036854775807 + 1
+----
+9223372036854775808.000
+
+query I
+SELECT -9223372036854775808
+----
+-9223372036854775808
+
+# --- UPDATE/DELETE with full-expression WHERE (acceptance criterion a3) ---
+
+statement ok
+CREATE TABLE t (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'x1')
+
+statement ok
+INSERT INTO t VALUES (2, 'x2')
+
+statement ok
+INSERT INTO t VALUES (3, 'y3')
+
+statement ok
+UPDATE t SET a = a + 1 WHERE b LIKE 'x%'
+
+query IT rowsort
+SELECT * FROM t
+----
+2
+x1
+3
+x2
+3
+y3
+
+statement ok
+DELETE FROM t WHERE a > 2 AND b LIKE 'y%'
+
+query IT rowsort
+SELECT * FROM t
+----
+2
+x1
+3
+x2
+
+statement ok
+UPDATE t SET a = a * 2 WHERE a IN (2, 3) AND NOT b = 'x1'
+
+query IT rowsort
+SELECT * FROM t
+----
+2
+x1
+6
+x2
+
+# --- column affinity (acceptance criterion a4) ---
+
+statement ok
+CREATE TABLE aff (i INTEGER, r REAL, tx TEXT, n NUMERIC, b BLOB)
+
+statement ok
+INSERT INTO aff VALUES (1.9, '1.0', 42, '48.00', 'abc')
+
+statement ok
+INSERT INTO aff VALUES ('12', 2.5, 3.14, '1e5', X'4142')
+
+query TTTTT rowsort
+SELECT * FROM aff
+----
+1.9
+1.0
+42
+48
+abc
+12
+2.5
+3.14
+100000
+AB
+
+# --- WHERE with affinity: text literal compared to INTEGER column ---
+
+statement ok
+CREATE TABLE w (a INTEGER)
+
+statement ok
+INSERT INTO w VALUES (1)
+
+statement ok
+INSERT INTO w VALUES (2)
+
+query I rowsort
+SELECT a FROM w WHERE a = '2'
+----
+2
+
+query I rowsort
+SELECT a FROM w WHERE a > '1'
+----
+2
