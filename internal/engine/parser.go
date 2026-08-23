@@ -768,6 +768,11 @@ func parseAlter(p *parser, tbls map[string]*Table, idxs map[string]*Index) (*Res
 		for i := range tbl.Rows {
 			tbl.Rows[i] = append(tbl.Rows[i], defaultForColumn(col))
 		}
+		// Rewrite the stored definition so the added column survives reload:
+		// persisted CREATE TABLE text is the single source of truth for the
+		// constraint set, and without this the new column would be dropped
+		// when loadTables re-parses the old SQL after a restart.
+		tbl.SQL = renderCreateTableSQL(nil, 0, tbl.Name, tbl.Columns, tbl.UniqueKeys)
 		return &Result{}, nil
 	default:
 		return nil, &SQLError{Message: "expected RENAME or ADD"}
@@ -888,18 +893,141 @@ func rewriteSQLTableName(sql, oldName, newName string) string {
 }
 
 // exprRender renders an expression back to SQL text for sqlite_master and for
-// recording a DEFAULT value in the persisted definition.
+// recording a DEFAULT value in the persisted definition. It must be able to
+// reproduce every node the parser produces, because the persisted CREATE TABLE
+// text is re-parsed on reload as the single source of truth for CHECK and
+// expression DEFAULT constraints: a CHECK (c > 0) collapsed here to "(expr)"
+// would reload as a bogus column reference and reject every row. Operator
+// precedence is reproduced faithfully by emitting parenthesised operands so the
+// re-parsed expression tree is identical.
 func exprRender(e Expr) string {
 	switch n := e.(type) {
 	case *LiteralExpr:
 		if n.val.IsNull() {
 			return "NULL"
 		}
-		return n.val.RenderCLI()
+		switch n.val.kind {
+		case Text:
+			return "'" + strings.ReplaceAll(n.val.textVal, "'", "''") + "'"
+		case Blob:
+			return "X'" + formatBlobHex(n.val.textVal) + "'"
+		default:
+			return n.val.RenderCLI()
+		}
+	case *ColumnExpr:
+		return n.name
+	case *CastExpr:
+		return "CAST(" + exprRender(n.inner) + " AS " + affinityName(n.aff) + ")"
+	case *ArithExpr:
+		return "(" + exprRender(n.left) + " " + n.op + " " + exprRender(n.right) + ")"
 	case *NegExpr:
 		return "-(" + exprRender(n.inner) + ")"
+	case *CompareExpr:
+		if n.nullSafe {
+			if n.op == "IS NOT" {
+				return "(" + exprRender(n.left) + " IS NOT " + exprRender(n.right) + ")"
+			}
+			return "(" + exprRender(n.left) + " IS " + exprRender(n.right) + ")"
+		}
+		return "(" + exprRender(n.left) + " " + n.op + " " + exprRender(n.right) + ")"
+	case *LogicalExpr:
+		return "(" + exprRender(n.left) + " " + n.op + " " + exprRender(n.right) + ")"
+	case *NotExpr:
+		return "NOT (" + exprRender(n.inner) + ")"
+	case *InExpr:
+		var b strings.Builder
+		b.WriteString("(")
+		b.WriteString(exprRender(n.left))
+		if n.negate {
+			b.WriteString(" NOT IN (")
+		} else {
+			b.WriteString(" IN (")
+		}
+		for i, item := range n.list {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(exprRender(item))
+		}
+		b.WriteString("))")
+		return b.String()
+	case *BetweenExpr:
+		var b strings.Builder
+		b.WriteString("(")
+		b.WriteString(exprRender(n.left))
+		if n.negate {
+			b.WriteString(" NOT BETWEEN ")
+		} else {
+			b.WriteString(" BETWEEN ")
+		}
+		b.WriteString(exprRender(n.low))
+		b.WriteString(" AND ")
+		b.WriteString(exprRender(n.high))
+		b.WriteString(")")
+		return b.String()
+	case *LikeExpr:
+		var b strings.Builder
+		b.WriteString("(")
+		b.WriteString(exprRender(n.left))
+		if n.negate {
+			b.WriteString(" NOT ")
+		} else {
+			b.WriteString(" ")
+		}
+		if n.glob {
+			b.WriteString("GLOB ")
+		} else {
+			b.WriteString("LIKE ")
+		}
+		b.WriteString(exprRender(n.pattern))
+		if n.escape != nil {
+			b.WriteString(" ESCAPE ")
+			b.WriteString(exprRender(n.escape))
+		}
+		b.WriteString(")")
+		return b.String()
+	case *CountStarExpr:
+		return "COUNT(*)"
+	case *AggExpr:
+		if n.star {
+			return n.funcName + "(*)"
+		}
+		if n.distinct {
+			return n.funcName + "(DISTINCT " + exprRender(n.arg) + ")"
+		}
+		return n.funcName + "(" + exprRender(n.arg) + ")"
 	default:
+		// Aggregate slots and any unknown node carry no renderable SQL text.
+		// They never appear in a CHECK/DEFAULT expression, whose grammar is the
+		// constant-expression subset.
 		return "(expr)"
+	}
+}
+
+// formatBlobHex renders blob bytes as the uppercase hex used in SQLite blob
+// literals.
+func formatBlobHex(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		b.WriteString(fmt.Sprintf("%02X", s[i]))
+	}
+	return b.String()
+}
+
+// affinityName renders an Affinity back to the SQLite type keyword it
+// corresponds to, for CAST expression round-tripping.
+func affinityName(a Affinity) string {
+	switch a {
+	case AffInteger:
+		return "INTEGER"
+	case AffReal:
+		return "REAL"
+	case AffText:
+		return "TEXT"
+	case AffBlob:
+		return "BLOB"
+	default:
+		return ""
 	}
 }
 

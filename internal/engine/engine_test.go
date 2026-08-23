@@ -663,6 +663,47 @@ func TestPersistCrashRecovery(t *testing.T) {
 	}
 }
 
+// TestPersistDDLRoundTrip locks in the persist-constraint-reload gap (a6-c4):
+// CHECK constraints and expression DEFAULTs must survive a restart — the
+// persisted CREATE TABLE text is re-parsed as the single source of truth, so a
+// CHECK/DEFAULT that collapses to "(expr)" on save reloads as a bogus column
+// reference and rejects every row. It also verifies ADD COLUMN survives reload
+// (parseAlter rewrites the stored SQL so the new column is not dropped).
+func TestPersistDDLRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db.json")
+	e1, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(t, e1, "CREATE TABLE tc (a INTEGER, c INTEGER CHECK (c > 0))")
+	exec(t, e1, "CREATE TABLE td (x INTEGER, y INTEGER DEFAULT (5 + 10))")
+	exec(t, e1, "CREATE TABLE ta (a INTEGER, b INTEGER)")
+	exec(t, e1, "INSERT INTO tc VALUES (1, 5)")
+	exec(t, e1, "INSERT INTO td (x) VALUES (9)")
+	exec(t, e1, "INSERT INTO ta VALUES (1, 2)")
+	exec(t, e1, "ALTER TABLE ta ADD COLUMN n TEXT")
+	// Second session simulates restart (acceptance a6-c4): all DDL state is
+	// rebuilt from the persisted SQL text.
+	e2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// CHECK survives reload: a legal insert passes, an illegal one is rejected.
+	exec(t, e2, "INSERT INTO tc VALUES (2, 6)")
+	if _, err := e2.Execute("INSERT INTO tc VALUES (3, 0)"); err == nil {
+		t.Error("CHECK constraint not enforced after reload: c=0 insert passed")
+	}
+	// Expression DEFAULT survives reload: omitted column still evaluates 5+10.
+	if got := rowsText(exec(t, e2, "SELECT y FROM td")); len(got) != 1 || got[0] != "15" {
+		t.Errorf("expression DEFAULT after reload: got %v want [15]", got)
+	}
+	// ADD COLUMN survives reload: the new, previously-omitted column is present.
+	if got := rowsText(exec(t, e2, "SELECT * FROM ta")); len(got) != 1 || got[0] != "1|2|NULL" {
+		t.Errorf("ADD COLUMN after reload: got %v want [1|2|NULL]", got)
+	}
+}
+
 func TestConcurrencyReadIsolation(t *testing.T) {
 	e := New()
 	exec(t, e, "CREATE TABLE t (a INTEGER)")
