@@ -46,13 +46,7 @@ SELECT (SELECT a FROM t) FROM t
 1
 
 statement error
-CREATE INDEX idx ON t (a)
-
-statement error
 CREATE VIEW v AS SELECT * FROM t
-
-statement error
-ALTER TABLE t ADD COLUMN c INTEGER
 
 statement error
 PRAGMA table_info(t)

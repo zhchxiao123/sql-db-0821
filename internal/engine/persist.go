@@ -59,28 +59,41 @@ func fromPValue(p pValue) Value {
 }
 
 type pCol struct {
-	Name string
-	Type string
+	Name    string
+	Type    string
+	NotNull bool
+	Unique  bool
+	SQL     string // synthesized column constraint text for sqlite_master
 }
 
 type pTable struct {
 	Name    string
 	Columns []pCol
 	Rows    [][]pValue
+	SQL     string // original CREATE TABLE statement
+}
+
+type pIndex struct {
+	Name    string
+	Table   string
+	Columns []string
+	Unique  bool
+	SQL     string // original CREATE INDEX statement
 }
 
 type pDB struct {
-	Tables map[string]pTable
+	Tables  map[string]pTable
+	Indexes map[string]pIndex
 }
 
 // marshalTables serializes the committed state. JSON sorts map keys, so the
-// output is stable regardless of table iteration order.
-func marshalTables(tables map[string]*Table) ([]byte, error) {
-	db := pDB{Tables: make(map[string]pTable, len(tables))}
+// output is stable regardless of table/index iteration order.
+func marshalTables(tables map[string]*Table, indexes map[string]*Index) ([]byte, error) {
+	db := pDB{Tables: make(map[string]pTable, len(tables)), Indexes: make(map[string]pIndex, len(indexes))}
 	for name, t := range tables {
-		pt := pTable{Name: t.Name, Columns: make([]pCol, len(t.Columns))}
+		pt := pTable{Name: t.Name, SQL: t.SQL, Columns: make([]pCol, len(t.Columns))}
 		for i, c := range t.Columns {
-			pt.Columns[i] = pCol{Name: c.Name, Type: c.Type}
+			pt.Columns[i] = pCol{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Unique: c.Unique}
 		}
 		pt.Rows = make([][]pValue, len(t.Rows))
 		for i, row := range t.Rows {
@@ -92,29 +105,47 @@ func marshalTables(tables map[string]*Table) ([]byte, error) {
 		}
 		db.Tables[name] = pt
 	}
+	for name, ix := range indexes {
+		db.Indexes[name] = pIndex{Name: ix.Name, Table: ix.Table, Columns: append([]string(nil), ix.Columns...), Unique: ix.Unique, SQL: ix.SQL}
+	}
 	return json.Marshal(&db)
 }
 
 // loadTables reads a persisted database back into committed state. A missing
 // file starts an empty database; a present but unparseable file is reported as
 // corrupt.
-func loadTables(path string) (map[string]*Table, error) {
+func loadTables(path string) (map[string]*Table, map[string]*Index, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return make(map[string]*Table), nil
+			return make(map[string]*Table), make(map[string]*Index), nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	var db pDB
 	if err := json.Unmarshal(data, &db); err != nil {
-		return nil, fmt.Errorf("corrupt database file %s: %v", path, err)
+		return nil, nil, fmt.Errorf("corrupt database file %s: %v", path, err)
 	}
 	tables := make(map[string]*Table, len(db.Tables))
 	for name, pt := range db.Tables {
-		t := &Table{Name: pt.Name, Columns: make([]Column, len(pt.Columns))}
-		for i, pc := range pt.Columns {
-			t.Columns[i] = Column{Name: pc.Name, Type: pc.Type}
+		// Re-parse the stored CREATE TABLE text so every constraint (DEFAULT,
+		// CHECK, PRIMARY KEY, UNIQUE, NOT NULL) is reconstructed exactly, not
+		// only the booleans persisted in pCol. Falls back to the persisted
+		// column metadata if the SQL text is missing.
+		t := &Table{Name: pt.Name, SQL: pt.SQL, Columns: make([]Column, len(pt.Columns))}
+		if pt.SQL != "" {
+			if rt, err := parseStoredTableSQL(pt.SQL); err == nil {
+				t.Columns = rt.Columns
+				t.UniqueKeys = rt.UniqueKeys
+			} else {
+				for i, pc := range pt.Columns {
+					t.Columns[i] = Column{Name: pc.Name, Type: pc.Type, NotNull: pc.NotNull, Unique: pc.Unique}
+				}
+			}
+		} else {
+			for i, pc := range pt.Columns {
+				t.Columns[i] = Column{Name: pc.Name, Type: pc.Type, NotNull: pc.NotNull, Unique: pc.Unique}
+			}
 		}
 		t.Rows = make([][]Value, len(pt.Rows))
 		for i, prow := range pt.Rows {
@@ -126,7 +157,11 @@ func loadTables(path string) (map[string]*Table, error) {
 		}
 		tables[name] = t
 	}
-	return tables, nil
+	indexes := make(map[string]*Index, len(db.Indexes))
+	for name, pi := range db.Indexes {
+		indexes[name] = &Index{Name: pi.Name, Table: pi.Table, Columns: append([]string(nil), pi.Columns...), Unique: pi.Unique, SQL: pi.SQL}
+	}
+	return tables, indexes, nil
 }
 
 // persist writes the committed state to the database file durably: serialize
@@ -134,7 +169,7 @@ func loadTables(path string) (map[string]*Table, error) {
 // the directory. This is what makes a COMMIT survive kill -9.
 func (e *Engine) persist() error {
 	e.lock.Lock()
-	data, err := marshalTables(e.tables)
+	data, err := marshalTables(e.tables, e.indexes)
 	e.lock.Unlock()
 	if err != nil {
 		return err
